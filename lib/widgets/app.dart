@@ -157,6 +157,35 @@ class HomePage extends StatelessWidget {
     }
 
     return Scaffold(
+      body: BottomNavigationBarComponent(),
+      );
+  }
+}
+
+
+class SettingPage extends StatelessWidget {
+  const SettingPage({super.key});
+
+  static Route<void> buildRoute({required int accountId}) {
+    return MaterialWidgetRoute(
+      page: PerAccountStoreWidget(accountId: accountId,
+        child: const SettingPage()));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = PerAccountStoreWidget.of(context);
+    final zulipLocalizations = ZulipLocalizations.of(context);
+
+    InlineSpan bold(String text) => TextSpan(
+      text: text, style: const TextStyle(fontWeight: FontWeight.bold));
+
+    int? testStreamId;
+    if (store.connection.realmUrl.origin == 'https://chat.zulip.org') {
+      testStreamId = 7; // i.e. `#test here`; TODO cut this scaffolding hack
+    }
+
+    return Scaffold(
       appBar: AppBar(title: const Text("Home")),
       body: Center(
         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -174,24 +203,63 @@ class HomePage extends StatelessWidget {
               Text(zulipLocalizations.subscribedToNStreams(store.subscriptions.length)),
             ])),
           const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => Navigator.push(context,
-              MessageListPage.buildRoute(context: context,
-                narrow: const AllMessagesNarrow())),
-            child: const Text("All messages")),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => Navigator.push(context,
-              RecentDmConversationsPage.buildRoute(context: context)),
-            child: const Text("Direct messages")),
-          if (testStreamId != null) ...[
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: () => Navigator.push(context,
-                MessageListPage.buildRoute(context: context,
-                  narrow: StreamNarrow(testStreamId!))),
-              child: const Text("#test here")), // scaffolding hack, see above
-          ],
+
         ])));
+  }
+}
+
+
+class BottomNavigationBarComponent extends StatefulWidget {
+  const BottomNavigationBarComponent({super.key});
+
+  @override
+  State<BottomNavigationBarComponent> createState() =>
+      _BottomNavigationBarComponentState();
+}
+
+class _BottomNavigationBarComponentState
+    extends State<BottomNavigationBarComponent> {
+  int _selectedIndex = 0;
+  static const TextStyle optionStyle =
+      TextStyle(fontSize: 30, fontWeight: FontWeight.bold);
+  static const List<Widget> _widgetOptions = <Widget>[
+    MessageListPage(narrow: const AllMessagesNarrow()),
+    RecentDmConversationsPage(),
+    SettingPage(),
+  ];
+
+  void _onItemTapped(int index) {
+    setState(() {
+      _selectedIndex = index;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _widgetOptions.elementAt(_selectedIndex),
+      bottomNavigationBar: BottomNavigationBar(
+        items: const <BottomNavigationBarItem>[
+          BottomNavigationBarItem(
+            icon: Icon(Icons.email),
+            label: 'All messages',
+            backgroundColor: Colors.red,
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.business),
+            label: 'Direct messages',
+            backgroundColor: Colors.green,
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings),
+            label: 'Settings',
+            backgroundColor: Colors.pink,
+          ),
+        ],
+        currentIndex: _selectedIndex,
+        selectedItemColor: Colors.amber[800],
+        onTap: _onItemTapped,
+      ),
+    );
   }
 }
