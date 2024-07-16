@@ -1,6 +1,6 @@
-# Zulip Flutter (beta)
+# Zulip Notes (beta)
 
-A Zulip client for Android and iOS, using Flutter.
+A Zulip Kind of interface for note taking for Android and iOS, using Flutter.
 
 This app is currently [in beta][beta].
 When it's ready, it [will become the new][] official mobile Zulip client.
