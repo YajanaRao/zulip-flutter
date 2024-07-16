@@ -1,9 +1,18 @@
 import 'package:checks/checks.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zulip/model/narrow.dart';
 import 'package:zulip/widgets/compose_box.dart';
+import 'package:zulip/widgets/store.dart';
+
+import '../example_data.dart' as eg;
+import '../flutter_checks.dart';
+import '../model/binding.dart';
 
 void main() {
+  TestZulipBinding.ensureInitialized();
+
   group('ComposeContentController', () {
     group('insertPadded', () {
       // Like `parseMarkedText` in test/model/autocomplete_test.dart,
@@ -103,6 +112,56 @@ void main() {
         testInsertPadded('text start; two empty lines; insertion point; two empty lines',
           '\n\n^\n\n',   'a\n', '\n\na\n\n^\n');
       });
+    });
+  });
+
+  group('ComposeBox textCapitalization', () {
+    late GlobalKey<ComposeBoxController> controllerKey;
+
+    Future<void> prepareComposeBox(WidgetTester tester, Narrow narrow) async {
+      addTearDown(testBinding.reset);
+      await testBinding.globalStore.add(eg.selfAccount, eg.initialSnapshot());
+
+      controllerKey = GlobalKey();
+      await tester.pumpWidget(
+        MaterialApp(
+          localizationsDelegates: ZulipLocalizations.localizationsDelegates,
+          supportedLocales: ZulipLocalizations.supportedLocales,
+          home: GlobalStoreWidget(
+            child: PerAccountStoreWidget(
+              accountId: eg.selfAccount.id,
+              child: ComposeBox(controllerKey: controllerKey, narrow: narrow)))));
+      await tester.pumpAndSettle();
+    }
+
+    void checkComposeBoxTextFields(WidgetTester tester, {required bool expectTopicTextField}) {
+      final composeBoxController = controllerKey.currentState!;
+
+      final topicTextField = tester.widgetList<TextField>(find.byWidgetPredicate(
+        (widget) => widget is TextField
+          && widget.controller == composeBoxController.topicController)).singleOrNull;
+      if (expectTopicTextField) {
+        check(topicTextField).isNotNull()
+          .textCapitalization.equals(TextCapitalization.none);
+      } else {
+        check(topicTextField).isNull();
+      }
+
+      final contentTextField = tester.widget<TextField>(find.byWidgetPredicate(
+        (widget) => widget is TextField
+          && widget.controller == composeBoxController.contentController));
+      check(contentTextField)
+        .textCapitalization.equals(TextCapitalization.sentences);
+    }
+
+    testWidgets('_StreamComposeBox', (tester) async {
+      await prepareComposeBox(tester, StreamNarrow(eg.stream().streamId));
+      checkComposeBoxTextFields(tester, expectTopicTextField: true);
+    });
+
+    testWidgets('_FixedDestinationComposeBox', (tester) async {
+      await prepareComposeBox(tester, TopicNarrow.ofMessage(eg.streamMessage()));
+      checkComposeBoxTextFields(tester, expectTopicTextField: false);
     });
   });
 }

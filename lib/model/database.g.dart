@@ -1,6 +1,6 @@
 // GENERATED CODE - DO NOT MODIFY BY HAND
 
-// ignore_for_file: unnecessary_cast
+// ignore_for_file: constant_identifier_names, unnecessary_cast
 
 part of 'database.dart';
 
@@ -78,9 +78,10 @@ class $AccountsTable extends Accounts with TableInfo<$AccountsTable, Account> {
         ackedPushToken
       ];
   @override
-  String get aliasedName => _alias ?? 'accounts';
+  String get aliasedName => _alias ?? actualTableName;
   @override
-  String get actualTableName => 'accounts';
+  String get actualTableName => $name;
+  static const String $name = 'accounts';
   @override
   VerificationContext validateIntegrity(Insertable<Account> instance,
       {bool isInserting = false}) {
@@ -181,8 +182,23 @@ class $AccountsTable extends Accounts with TableInfo<$AccountsTable, Account> {
 }
 
 class Account extends DataClass implements Insertable<Account> {
+  /// The ID of this account in the app's local database.
+  ///
+  /// This uniquely identifies the account within this install of the app,
+  /// and never changes for a given account.  It has no meaning to the server,
+  /// though, or anywhere else outside this install of the app.
   final int id;
+
+  /// The URL of the Zulip realm this account is on.
+  ///
+  /// This corresponds to [GetServerSettingsResult.realmUrl].
+  /// It never changes for a given account.
   final Uri realmUrl;
+
+  /// The Zulip user ID of this account.
+  ///
+  /// This is the identifier the server uses for the account.
+  /// It never changes for a given account.
   final int userId;
   final String email;
   final String apiKey;
@@ -205,8 +221,8 @@ class Account extends DataClass implements Insertable<Account> {
     final map = <String, Expression>{};
     map['id'] = Variable<int>(id);
     {
-      final converter = $AccountsTable.$converterrealmUrl;
-      map['realm_url'] = Variable<String>(converter.toSql(realmUrl));
+      map['realm_url'] =
+          Variable<String>($AccountsTable.$converterrealmUrl.toSql(realmUrl));
     }
     map['user_id'] = Variable<int>(userId);
     map['email'] = Variable<String>(email);
@@ -419,8 +435,8 @@ class AccountsCompanion extends UpdateCompanion<Account> {
       map['id'] = Variable<int>(id.value);
     }
     if (realmUrl.present) {
-      final converter = $AccountsTable.$converterrealmUrl;
-      map['realm_url'] = Variable<String>(converter.toSql(realmUrl.value));
+      map['realm_url'] = Variable<String>(
+          $AccountsTable.$converterrealmUrl.toSql(realmUrl.value));
     }
     if (userId.present) {
       map['user_id'] = Variable<int>(userId.value);
@@ -465,10 +481,219 @@ class AccountsCompanion extends UpdateCompanion<Account> {
 
 abstract class _$AppDatabase extends GeneratedDatabase {
   _$AppDatabase(QueryExecutor e) : super(e);
+  _$AppDatabaseManager get managers => _$AppDatabaseManager(this);
   late final $AccountsTable accounts = $AccountsTable(this);
   @override
   Iterable<TableInfo<Table, Object?>> get allTables =>
       allSchemaEntities.whereType<TableInfo<Table, Object?>>();
   @override
   List<DatabaseSchemaEntity> get allSchemaEntities => [accounts];
+}
+
+typedef $$AccountsTableInsertCompanionBuilder = AccountsCompanion Function({
+  Value<int> id,
+  required Uri realmUrl,
+  required int userId,
+  required String email,
+  required String apiKey,
+  required String zulipVersion,
+  Value<String?> zulipMergeBase,
+  required int zulipFeatureLevel,
+  Value<String?> ackedPushToken,
+});
+typedef $$AccountsTableUpdateCompanionBuilder = AccountsCompanion Function({
+  Value<int> id,
+  Value<Uri> realmUrl,
+  Value<int> userId,
+  Value<String> email,
+  Value<String> apiKey,
+  Value<String> zulipVersion,
+  Value<String?> zulipMergeBase,
+  Value<int> zulipFeatureLevel,
+  Value<String?> ackedPushToken,
+});
+
+class $$AccountsTableTableManager extends RootTableManager<
+    _$AppDatabase,
+    $AccountsTable,
+    Account,
+    $$AccountsTableFilterComposer,
+    $$AccountsTableOrderingComposer,
+    $$AccountsTableProcessedTableManager,
+    $$AccountsTableInsertCompanionBuilder,
+    $$AccountsTableUpdateCompanionBuilder> {
+  $$AccountsTableTableManager(_$AppDatabase db, $AccountsTable table)
+      : super(TableManagerState(
+          db: db,
+          table: table,
+          filteringComposer:
+              $$AccountsTableFilterComposer(ComposerState(db, table)),
+          orderingComposer:
+              $$AccountsTableOrderingComposer(ComposerState(db, table)),
+          getChildManagerBuilder: (p) =>
+              $$AccountsTableProcessedTableManager(p),
+          getUpdateCompanionBuilder: ({
+            Value<int> id = const Value.absent(),
+            Value<Uri> realmUrl = const Value.absent(),
+            Value<int> userId = const Value.absent(),
+            Value<String> email = const Value.absent(),
+            Value<String> apiKey = const Value.absent(),
+            Value<String> zulipVersion = const Value.absent(),
+            Value<String?> zulipMergeBase = const Value.absent(),
+            Value<int> zulipFeatureLevel = const Value.absent(),
+            Value<String?> ackedPushToken = const Value.absent(),
+          }) =>
+              AccountsCompanion(
+            id: id,
+            realmUrl: realmUrl,
+            userId: userId,
+            email: email,
+            apiKey: apiKey,
+            zulipVersion: zulipVersion,
+            zulipMergeBase: zulipMergeBase,
+            zulipFeatureLevel: zulipFeatureLevel,
+            ackedPushToken: ackedPushToken,
+          ),
+          getInsertCompanionBuilder: ({
+            Value<int> id = const Value.absent(),
+            required Uri realmUrl,
+            required int userId,
+            required String email,
+            required String apiKey,
+            required String zulipVersion,
+            Value<String?> zulipMergeBase = const Value.absent(),
+            required int zulipFeatureLevel,
+            Value<String?> ackedPushToken = const Value.absent(),
+          }) =>
+              AccountsCompanion.insert(
+            id: id,
+            realmUrl: realmUrl,
+            userId: userId,
+            email: email,
+            apiKey: apiKey,
+            zulipVersion: zulipVersion,
+            zulipMergeBase: zulipMergeBase,
+            zulipFeatureLevel: zulipFeatureLevel,
+            ackedPushToken: ackedPushToken,
+          ),
+        ));
+}
+
+class $$AccountsTableProcessedTableManager extends ProcessedTableManager<
+    _$AppDatabase,
+    $AccountsTable,
+    Account,
+    $$AccountsTableFilterComposer,
+    $$AccountsTableOrderingComposer,
+    $$AccountsTableProcessedTableManager,
+    $$AccountsTableInsertCompanionBuilder,
+    $$AccountsTableUpdateCompanionBuilder> {
+  $$AccountsTableProcessedTableManager(super.$state);
+}
+
+class $$AccountsTableFilterComposer
+    extends FilterComposer<_$AppDatabase, $AccountsTable> {
+  $$AccountsTableFilterComposer(super.$state);
+  ColumnFilters<int> get id => $state.composableBuilder(
+      column: $state.table.id,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnWithTypeConverterFilters<Uri, Uri, String> get realmUrl =>
+      $state.composableBuilder(
+          column: $state.table.realmUrl,
+          builder: (column, joinBuilders) => ColumnWithTypeConverterFilters(
+              column,
+              joinBuilders: joinBuilders));
+
+  ColumnFilters<int> get userId => $state.composableBuilder(
+      column: $state.table.userId,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnFilters<String> get email => $state.composableBuilder(
+      column: $state.table.email,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnFilters<String> get apiKey => $state.composableBuilder(
+      column: $state.table.apiKey,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnFilters<String> get zulipVersion => $state.composableBuilder(
+      column: $state.table.zulipVersion,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnFilters<String> get zulipMergeBase => $state.composableBuilder(
+      column: $state.table.zulipMergeBase,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnFilters<int> get zulipFeatureLevel => $state.composableBuilder(
+      column: $state.table.zulipFeatureLevel,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+
+  ColumnFilters<String> get ackedPushToken => $state.composableBuilder(
+      column: $state.table.ackedPushToken,
+      builder: (column, joinBuilders) =>
+          ColumnFilters(column, joinBuilders: joinBuilders));
+}
+
+class $$AccountsTableOrderingComposer
+    extends OrderingComposer<_$AppDatabase, $AccountsTable> {
+  $$AccountsTableOrderingComposer(super.$state);
+  ColumnOrderings<int> get id => $state.composableBuilder(
+      column: $state.table.id,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<String> get realmUrl => $state.composableBuilder(
+      column: $state.table.realmUrl,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<int> get userId => $state.composableBuilder(
+      column: $state.table.userId,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<String> get email => $state.composableBuilder(
+      column: $state.table.email,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<String> get apiKey => $state.composableBuilder(
+      column: $state.table.apiKey,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<String> get zulipVersion => $state.composableBuilder(
+      column: $state.table.zulipVersion,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<String> get zulipMergeBase => $state.composableBuilder(
+      column: $state.table.zulipMergeBase,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<int> get zulipFeatureLevel => $state.composableBuilder(
+      column: $state.table.zulipFeatureLevel,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+
+  ColumnOrderings<String> get ackedPushToken => $state.composableBuilder(
+      column: $state.table.ackedPushToken,
+      builder: (column, joinBuilders) =>
+          ColumnOrderings(column, joinBuilders: joinBuilders));
+}
+
+class _$AppDatabaseManager {
+  final _$AppDatabase _db;
+  _$AppDatabaseManager(this._db);
+  $$AccountsTableTableManager get accounts =>
+      $$AccountsTableTableManager(_db, _db.accounts);
 }

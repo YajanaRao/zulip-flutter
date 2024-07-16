@@ -5,9 +5,11 @@ import 'package:checks/checks.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:test/scaffolding.dart';
+import 'package:zulip/api/model/initial_snapshot.dart';
 import 'package:zulip/api/model/model.dart';
 import 'package:zulip/model/autocomplete.dart';
 import 'package:zulip/model/narrow.dart';
+import 'package:zulip/model/store.dart';
 import 'package:zulip/widgets/compose_box.dart';
 
 import '../example_data.dart' as eg;
@@ -20,7 +22,7 @@ void main() {
       final TextSelection selection;
       int? expectedSyntaxStart;
       final textBuffer = StringBuffer();
-      final caretPositions = [];
+      final caretPositions = <int>[];
       int i = 0;
       for (final char in markedText.codeUnits) {
         if (char == 94 /* ^ */) {
@@ -166,9 +168,9 @@ void main() {
   });
 
   test('MentionAutocompleteView misc', () async {
-    const narrow = AllMessagesNarrow();
-    final store = eg.store()
-      ..addUsers([eg.selfUser, eg.otherUser, eg.thirdUser]);
+    const narrow = StreamNarrow(1);
+    final store = eg.store();
+    await store.addUsers([eg.selfUser, eg.otherUser, eg.thirdUser]);
     final view = MentionAutocompleteView.init(store: store, narrow: narrow);
 
     bool done = false;
@@ -182,10 +184,10 @@ void main() {
   });
 
   test('MentionAutocompleteView not starve timers', () {
-    fakeAsync((binding) {
-      const narrow = AllMessagesNarrow();
-      final store = eg.store()
-        ..addUsers([eg.selfUser, eg.otherUser, eg.thirdUser]);
+    fakeAsync((binding) async {
+      const narrow = StreamNarrow(1);
+      final store = eg.store();
+      await store.addUsers([eg.selfUser, eg.otherUser, eg.thirdUser]);
       final view = MentionAutocompleteView.init(store: store, narrow: narrow);
 
       bool searchDone = false;
@@ -218,10 +220,10 @@ void main() {
   });
 
   test('MentionAutocompleteView yield between batches of 1000', () async {
-    const narrow = AllMessagesNarrow();
+    const narrow = StreamNarrow(1);
     final store = eg.store();
     for (int i = 0; i < 2500; i++) {
-      store.addUser(eg.user(userId: i, email: 'user$i@example.com', fullName: 'User $i'));
+      await store.addUser(eg.user(userId: i, email: 'user$i@example.com', fullName: 'User $i'));
     }
     final view = MentionAutocompleteView.init(store: store, narrow: narrow);
 
@@ -241,10 +243,10 @@ void main() {
   });
 
   test('MentionAutocompleteView new query during computation replaces old', () async {
-    const narrow = AllMessagesNarrow();
+    const narrow = StreamNarrow(1);
     final store = eg.store();
     for (int i = 0; i < 1500; i++) {
-      store.addUser(eg.user(userId: i, email: 'user$i@example.com', fullName: 'User $i'));
+      await store.addUser(eg.user(userId: i, email: 'user$i@example.com', fullName: 'User $i'));
     }
     final view = MentionAutocompleteView.init(store: store, narrow: narrow);
 
@@ -274,71 +276,202 @@ void main() {
     }
   });
 
-  test('MentionAutocompleteView mutating store.users while in progress causes retry', () async {
-    const narrow = AllMessagesNarrow();
+  test('MentionAutocompleteView mutating store.users while in progress does not '
+      'prevent query from finishing', () async {
+    const narrow = StreamNarrow(1);
     final store = eg.store();
-    for (int i = 0; i < 1500; i++) {
-      store.addUser(eg.user(userId: i, email: 'user$i@example.com', fullName: 'User $i'));
+    for (int i = 0; i < 2500; i++) {
+      await store.addUser(eg.user(userId: i, email: 'user$i@example.com', fullName: 'User $i'));
     }
     final view = MentionAutocompleteView.init(store: store, narrow: narrow);
 
     bool done = false;
     view.addListener(() { done = true; });
-    view.query = MentionAutocompleteQuery('User 10000');
+    view.query = MentionAutocompleteQuery('User 110');
 
     await Future(() {});
     check(done).isFalse();
-    store.addUser(eg.user(userId: 10000, email: 'user10000@example.com', fullName: 'User 10000'));
+    await store.addUser(eg.user(userId: 11000, email: 'user11000@example.com', fullName: 'User 11000'));
     await Future(() {});
     check(done).isFalse();
-    await Future(() {});
-    check(done).isTrue();
-    check(view.results).single
-      .isA<UserMentionAutocompleteResult>()
-      .userId.equals(10000);
-    // new result sticks; no "zombie" result from `store.users` pre-mutation
-    for (int i = 0; i < 10; i++) { // for good measure
+    for (int i = 0; i < 3; i++) {
       await Future(() {});
-      check(view.results).single
-        .isA<UserMentionAutocompleteResult>()
-        .userId.equals(10000);
     }
+    check(done).isTrue();
+    final results = view.results
+      .map((e) => (e as UserMentionAutocompleteResult).userId);
+    check(results)
+      ..contains(110)
+      ..contains(1100)
+      // Does not include the newly-added user as we finish the query with stale users.
+      ..not((results) => results.contains(11000));
   });
 
-  test('MentionAutocompleteQuery.testUser', () {
+  group('MentionAutocompleteQuery.testUser', () {
     doCheck(String rawQuery, User user, bool expected) {
       final result = MentionAutocompleteQuery(rawQuery)
         .testUser(user, AutocompleteDataCache());
       expected ? check(result).isTrue() : check(result).isFalse();
     }
 
-    doCheck('', eg.user(fullName: 'Full Name'), true);
-    doCheck('', eg.user(fullName: ''), true); // Unlikely case, but should not crash
-    doCheck('Full Name', eg.user(fullName: 'Full Name'), true);
-    doCheck('full name', eg.user(fullName: 'Full Name'), true);
-    doCheck('Full Name', eg.user(fullName: 'full name'), true);
-    doCheck('Full', eg.user(fullName: 'Full Name'), true);
-    doCheck('Name', eg.user(fullName: 'Full Name'), true);
-    doCheck('Full Name', eg.user(fullName: 'Fully Named'), true);
-    doCheck('Full Four', eg.user(fullName: 'Full Name Four Words'), true);
-    doCheck('Name Words', eg.user(fullName: 'Full Name Four Words'), true);
-    doCheck('Full F', eg.user(fullName: 'Full Name Four Words'), true);
-    doCheck('F Four', eg.user(fullName: 'Full Name Four Words'), true);
-    doCheck('full full', eg.user(fullName: 'Full Full Name'), true);
-    doCheck('full full', eg.user(fullName: 'Full Name Full'), true);
+    test('user is always excluded when not active regardless of other criteria', () {
+      doCheck('Full Name', eg.user(fullName: 'Full Name', isActive: false), false);
+      // When active then other criteria will be checked
+      doCheck('Full Name', eg.user(fullName: 'Full Name', isActive: true), true);
+    });
 
-    doCheck('F', eg.user(fullName: ''), false); // Unlikely case, but should not crash
-    doCheck('Fully Named', eg.user(fullName: 'Full Name'), false);
-    doCheck('Full Name', eg.user(fullName: 'Full'), false);
-    doCheck('Full Name', eg.user(fullName: 'Name'), false);
-    doCheck('ull ame', eg.user(fullName: 'Full Name'), false);
-    doCheck('ull Name', eg.user(fullName: 'Full Name'), false);
-    doCheck('Full ame', eg.user(fullName: 'Full Name'), false);
-    doCheck('Full Full', eg.user(fullName: 'Full Name'), false);
-    doCheck('Name Name', eg.user(fullName: 'Full Name'), false);
-    doCheck('Name Full', eg.user(fullName: 'Full Name'), false);
-    doCheck('Name Four Full Words', eg.user(fullName: 'Full Name Four Words'), false);
-    doCheck('F Full', eg.user(fullName: 'Full Name Four Words'), false);
-    doCheck('Four F', eg.user(fullName: 'Full Name Four Words'), false);
+    test('user is included if fullname words match the query', () {
+      doCheck('', eg.user(fullName: 'Full Name'), true);
+      doCheck('', eg.user(fullName: ''), true); // Unlikely case, but should not crash
+      doCheck('Full Name', eg.user(fullName: 'Full Name'), true);
+      doCheck('full name', eg.user(fullName: 'Full Name'), true);
+      doCheck('Full Name', eg.user(fullName: 'full name'), true);
+      doCheck('Full', eg.user(fullName: 'Full Name'), true);
+      doCheck('Name', eg.user(fullName: 'Full Name'), true);
+      doCheck('Full Name', eg.user(fullName: 'Fully Named'), true);
+      doCheck('Full Four', eg.user(fullName: 'Full Name Four Words'), true);
+      doCheck('Name Words', eg.user(fullName: 'Full Name Four Words'), true);
+      doCheck('Full F', eg.user(fullName: 'Full Name Four Words'), true);
+      doCheck('F Four', eg.user(fullName: 'Full Name Four Words'), true);
+      doCheck('full full', eg.user(fullName: 'Full Full Name'), true);
+      doCheck('full full', eg.user(fullName: 'Full Name Full'), true);
+
+      doCheck('F', eg.user(fullName: ''), false); // Unlikely case, but should not crash
+      doCheck('Fully Named', eg.user(fullName: 'Full Name'), false);
+      doCheck('Full Name', eg.user(fullName: 'Full'), false);
+      doCheck('Full Name', eg.user(fullName: 'Name'), false);
+      doCheck('ull ame', eg.user(fullName: 'Full Name'), false);
+      doCheck('ull Name', eg.user(fullName: 'Full Name'), false);
+      doCheck('Full ame', eg.user(fullName: 'Full Name'), false);
+      doCheck('Full Full', eg.user(fullName: 'Full Name'), false);
+      doCheck('Name Name', eg.user(fullName: 'Full Name'), false);
+      doCheck('Name Full', eg.user(fullName: 'Full Name'), false);
+      doCheck('Name Four Full Words', eg.user(fullName: 'Full Name Four Words'), false);
+      doCheck('F Full', eg.user(fullName: 'Full Name Four Words'), false);
+      doCheck('Four F', eg.user(fullName: 'Full Name Four Words'), false);
+    });
+  });
+
+  group('MentionAutocompleteView sorting users results', () {
+    late PerAccountStore store;
+
+    Future<void> prepare({
+      List<User> users = const [],
+      List<RecentDmConversation> dmConversations = const [],
+    }) async {
+      store = eg.store(initialSnapshot: eg.initialSnapshot(
+        recentPrivateConversations: dmConversations));
+      await store.addUsers(users);
+    }
+
+    group('MentionAutocompleteView.compareByDms', () {
+      const idA = 1;
+      const idB = 2;
+
+      int compareAB() => MentionAutocompleteView.compareByDms(
+        eg.user(userId: idA),
+        eg.user(userId: idB),
+        store: store,
+      );
+
+      test('has DMs with userA and userB, latest with userA -> prioritizes userA', () async {
+        await prepare(dmConversations: [
+          RecentDmConversation(userIds: [idA],      maxMessageId: 200),
+          RecentDmConversation(userIds: [idA, idB], maxMessageId: 100),
+        ]);
+        check(compareAB()).isLessThan(0);
+      });
+
+      test('has DMs with userA and userB, latest with userB -> prioritizes userB', () async {
+        await prepare(dmConversations: [
+          RecentDmConversation(userIds: [idB],      maxMessageId: 200),
+          RecentDmConversation(userIds: [idA, idB], maxMessageId: 100),
+        ]);
+        check(compareAB()).isGreaterThan(0);
+      });
+
+      test('has DMs with userA and userB, equally recent -> prioritizes neither', () async {
+        await prepare(dmConversations: [
+          RecentDmConversation(userIds: [idA, idB], maxMessageId: 100),
+        ]);
+        check(compareAB()).equals(0);
+      });
+
+      test('has DMs with userA but not userB -> prioritizes userA', () async {
+        await prepare(dmConversations: [
+          RecentDmConversation(userIds: [idA], maxMessageId: 100),
+        ]);
+        check(compareAB()).isLessThan(0);
+      });
+
+      test('has DMs with userB but not userA -> prioritizes userB', () async {
+        await prepare(dmConversations: [
+          RecentDmConversation(userIds: [idB], maxMessageId: 100),
+        ]);
+        check(compareAB()).isGreaterThan(0);
+      });
+
+      test('has no DMs with userA or userB -> prioritizes neither', () async {
+        await prepare(dmConversations: []);
+        check(compareAB()).equals(0);
+      });
+    });
+
+    group('autocomplete suggests relevant users in the intended order', () {
+      // The order should be:
+      // 1. Users most recent in the DM conversations
+
+      Future<void> checkResultsIn(Narrow narrow, {required List<int> expected}) async {
+        final users = [
+          eg.user(userId: 0),
+          eg.user(userId: 1),
+          eg.user(userId: 2),
+          eg.user(userId: 3),
+          eg.user(userId: 4),
+        ];
+
+        final dmConversations = [
+          RecentDmConversation(userIds: [3],    maxMessageId: 300),
+          RecentDmConversation(userIds: [0],    maxMessageId: 200),
+          RecentDmConversation(userIds: [0, 1], maxMessageId: 100),
+        ];
+
+        await prepare(users: users, dmConversations: dmConversations);
+        final view = MentionAutocompleteView.init(store: store, narrow: narrow);
+
+        bool done = false;
+        view.addListener(() { done = true; });
+        view.query = MentionAutocompleteQuery('');
+        await Future(() {});
+        check(done).isTrue();
+        final results = view.results
+          .map((e) => (e as UserMentionAutocompleteResult).userId);
+        check(results).deepEquals(expected);
+      }
+
+      test('StreamNarrow', () async {
+        await checkResultsIn(const StreamNarrow(1), expected: [3, 0, 1, 2, 4]);
+      });
+
+      test('TopicNarrow', () async {
+        await checkResultsIn(const TopicNarrow(1, 'topic'), expected: [3, 0, 1, 2, 4]);
+      });
+
+      test('DmNarrow', () async {
+        await checkResultsIn(
+          DmNarrow.withUser(eg.selfUser.userId, selfUserId: eg.selfUser.userId),
+          expected: [3, 0, 1, 2, 4],
+        );
+      });
+
+      test('CombinedFeedNarrow', () async {
+        // As we do not expect a compose box in [CombinedFeedNarrow], it should
+        // not proceed to show any results.
+        await check(checkResultsIn(
+          const CombinedFeedNarrow(),
+          expected: [0, 1, 2, 3, 4])
+        ).throws();
+      });
+    });
   });
 }

@@ -302,6 +302,7 @@ class _ContentInput extends StatelessWidget {
               style: TextStyle(color: colorScheme.onSurface),
               decoration: InputDecoration.collapsed(hintText: hintText),
               maxLines: null,
+              textCapitalization: TextCapitalization.sentences,
             );
           }),
         ));
@@ -329,7 +330,7 @@ class _StreamContentInput extends StatefulWidget {
 class _StreamContentInputState extends State<_StreamContentInput> {
   late String _topicTextNormalized;
 
-  _topicChanged() {
+  void _topicChanged() {
     setState(() {
       _topicTextNormalized = widget.topicController.textNormalized;
     });
@@ -362,12 +363,12 @@ class _StreamContentInputState extends State<_StreamContentInput> {
     final store = PerAccountStoreWidget.of(context);
     final zulipLocalizations = ZulipLocalizations.of(context);
     final streamName = store.streams[widget.narrow.streamId]?.name
-      ?? zulipLocalizations.composeBoxUnknownStreamName;
+      ?? zulipLocalizations.composeBoxUnknownChannelName;
     return _ContentInput(
       narrow: widget.narrow,
       controller: widget.controller,
       focusNode: widget.focusNode,
-      hintText: zulipLocalizations.composeBoxStreamContentHint(streamName, _topicTextNormalized));
+      hintText: zulipLocalizations.composeBoxChannelContentHint(streamName, _topicTextNormalized));
   }
 }
 
@@ -388,8 +389,8 @@ class _FixedDestinationContentInput extends StatelessWidget {
       case TopicNarrow(:final streamId, :final topic):
         final store = PerAccountStoreWidget.of(context);
         final streamName = store.streams[streamId]?.name
-          ?? zulipLocalizations.composeBoxUnknownStreamName;
-        return zulipLocalizations.composeBoxStreamContentHint(streamName, topic);
+          ?? zulipLocalizations.composeBoxUnknownChannelName;
+        return zulipLocalizations.composeBoxChannelContentHint(streamName, topic);
 
       case DmNarrow(otherRecipientIds: []): // The self-1:1 thread.
         return zulipLocalizations.composeBoxSelfDmContentHint;
@@ -479,8 +480,8 @@ Future<void> _uploadFiles({
       url = Uri.parse(result.uri);
     } catch (e) {
       if (!context.mounted) return;
-      // TODO(#37): Specifically handle `413 Payload Too Large`
-      // TODO(#37): On API errors, quote `msg` from server, with "The server said:"
+      // TODO(#741): Specifically handle `413 Payload Too Large`
+      // TODO(#741): On API errors, quote `msg` from server, with "The server said:"
       showErrorDialog(context: context,
         title: zulipLocalizations.errorFailedToUploadFileTitle(filename),
         message: e.toString());
@@ -677,7 +678,7 @@ class _SendButton extends StatefulWidget {
 }
 
 class _SendButtonState extends State<_SendButton> {
-  _hasErrorsChanged() {
+  void _hasErrorsChanged() {
     setState(() {
       // Update disabled/non-disabled state
     });
@@ -719,7 +720,8 @@ class _SendButtonState extends State<_SendButton> {
     if (_hasValidationErrors) {
       final zulipLocalizations = ZulipLocalizations.of(context);
       List<String> validationErrorMessages = [
-        for (final error in widget.topicController?.validationErrors ?? const [])
+        for (final error in widget.topicController?.validationErrors
+                            ?? const <TopicValidationError>[])
           error.message(zulipLocalizations),
         for (final error in widget.contentController.validationErrors)
           error.message(zulipLocalizations),
@@ -761,12 +763,15 @@ class _SendButtonState extends State<_SendButton> {
       ),
       child: IconButton(
         tooltip: zulipLocalizations.composeBoxSendTooltip,
-
-        // Match the height of the content input. Zeroing the padding lets the
-        // constraints take over.
-        constraints: const BoxConstraints(minWidth: _sendButtonSize, minHeight: _sendButtonSize),
-        padding: const EdgeInsets.all(0),
-
+        style: const ButtonStyle(
+          // Match the height of the content input.
+          minimumSize: WidgetStatePropertyAll(Size.square(_sendButtonSize)),
+          // With the default of [MaterialTapTargetSize.padded], not just the
+          // tap target but the visual button would get padded to 48px square.
+          // It would be nice if the tap target extended invisibly out from the
+          // button, to make a 48px square, but that's not the behavior we get.
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
         color: foregroundColor,
         icon: const Icon(Icons.send),
         onPressed: _send));
@@ -808,7 +813,7 @@ class _ComposeBoxLayout extends StatelessWidget {
     );
 
     return Material(
-      color: colorScheme.surfaceVariant,
+      color: colorScheme.surfaceContainerHighest,
       child: SafeArea(
         minimum: const EdgeInsets.fromLTRB(8, 0, 8, 8),
         child: Padding(
@@ -962,7 +967,7 @@ class ComposeBox extends StatelessWidget {
       return _FixedDestinationComposeBox(key: controllerKey, narrow: narrow);
     } else if (narrow is DmNarrow) {
       return _FixedDestinationComposeBox(key: controllerKey, narrow: narrow);
-    } else if (narrow is AllMessagesNarrow) {
+    } else if (narrow is CombinedFeedNarrow) {
       return const SizedBox.shrink();
     } else {
       throw Exception("impossible narrow"); // TODO(dart-3): show this statically

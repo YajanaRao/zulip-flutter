@@ -2,19 +2,22 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:checks/checks.dart';
-import 'package:checks/context.dart';
-import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:http/http.dart' as http;
 import 'package:test/scaffolding.dart';
 import 'package:zulip/api/core.dart';
 import 'package:zulip/api/exception.dart';
+import 'package:zulip/model/binding.dart';
+import 'package:zulip/model/localizations.dart';
 
+import '../model/binding.dart';
 import '../stdlib_checks.dart';
 import 'exception_checks.dart';
 import 'fake_api.dart';
 import '../example_data.dart' as eg;
 
 void main() {
+  TestZulipBinding.ensureInitialized();
+
   test('ApiConnection.get', () async {
     Future<void> checkRequest(Map<String, dynamic>? params, String expectedRelativeUrl) {
       return FakeApiConnection.with_(account: eg.selfAccount, (connection) async {
@@ -23,7 +26,10 @@ void main() {
         check(connection.lastRequest!).isA<http.Request>()
           ..method.equals('GET')
           ..url.asString.equals('${eg.realmUrl.origin}$expectedRelativeUrl')
-          ..headers.deepEquals(authHeader(email: eg.selfAccount.email, apiKey: eg.selfAccount.apiKey))
+          ..headers.deepEquals({
+            ...authHeader(email: eg.selfAccount.email, apiKey: eg.selfAccount.apiKey),
+            ...kFallbackUserAgentHeader,
+          })
           ..body.equals('');
       });
     }
@@ -53,6 +59,7 @@ void main() {
           ..url.asString.equals('${eg.realmUrl.origin}/api/v1/example/route')
           ..headers.deepEquals({
             ...authHeader(email: eg.selfAccount.email, apiKey: eg.selfAccount.apiKey),
+            ...kFallbackUserAgentHeader,
             if (expectContentType)
               'content-type': 'application/x-www-form-urlencoded; charset=utf-8',
           })
@@ -83,14 +90,17 @@ void main() {
         check(connection.lastRequest!).isA<http.MultipartRequest>()
           ..method.equals('POST')
           ..url.asString.equals('${eg.realmUrl.origin}/api/v1/example/route')
-          ..headers.deepEquals(authHeader(email: eg.selfAccount.email, apiKey: eg.selfAccount.apiKey))
+          ..headers.deepEquals({
+            ...authHeader(email: eg.selfAccount.email, apiKey: eg.selfAccount.apiKey),
+            ...kFallbackUserAgentHeader,
+          })
           ..fields.deepEquals({})
-          ..files.single.which(it()
+          ..files.single.which((it) => it
             ..field.equals('file')
             ..length.equals(length)
             ..filename.equals(filename)
             ..has<Future<List<int>>>((f) => f.finalize().toBytes(), 'contents')
-              .completes(it()..deepEquals(content.expand((l) => l)))
+              .completes((it) => it.deepEquals(content.expand((l) => l)))
           );
       });
     }
@@ -115,6 +125,7 @@ void main() {
           ..url.asString.equals('${eg.realmUrl.origin}/api/v1/example/route')
           ..headers.deepEquals({
             ...authHeader(email: eg.selfAccount.email, apiKey: eg.selfAccount.apiKey),
+            ...kFallbackUserAgentHeader,
             if (expectContentType)
               'content-type': 'application/x-www-form-urlencoded; charset=utf-8',
           })
@@ -148,17 +159,22 @@ void main() {
     Future<void> checkRequest<T extends Object>(
         T exception, Condition<NetworkException> condition) {
       return check(tryRequest(exception: exception))
-        .throws<NetworkException>(it()
+        .throws<NetworkException>((it) => it
           ..routeName.equals(kExampleRouteName)
           ..cause.equals(exception)
           ..which(condition));
     }
 
-    final zulipLocalizations = lookupZulipLocalizations(ZulipLocalizations.supportedLocales.first);
-    checkRequest(http.ClientException('Oops'), it()..message.equals('Oops'));
-    checkRequest(const TlsException('Oops'), it()..message.equals('Oops'));
-    checkRequest((foo: 'bar'), it()
-      ..message.equals(zulipLocalizations.errorNetworkRequestFailed));
+    final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+    checkRequest(http.ClientException('Oops'), (it) => it
+      ..message.equals('Oops')
+      ..asString.equals('NetworkException: Oops (ClientException: Oops)'));
+    checkRequest(const TlsException('Oops'), (it) => it
+      ..message.equals('Oops')
+      ..asString.equals('NetworkException: Oops (TlsException: Oops)'));
+    checkRequest((foo: 'bar'), (it) => it
+      ..message.equals(zulipLocalizations.errorNetworkRequestFailed)
+      ..asString.equals('NetworkException: Network request failed ((foo: bar))'));
   });
 
   test('API 4xx errors, well formed', () async {
@@ -176,7 +192,7 @@ void main() {
         ...data,
       };
       await check(tryRequest(httpStatus: httpStatus, json: json))
-        .throws<ZulipApiException>(it()
+        .throws<ZulipApiException>((it) => it
           ..routeName.equals(kExampleRouteName)
           ..httpStatus.equals(httpStatus)
           ..code.equals(expectedCode ?? code!)
@@ -197,7 +213,7 @@ void main() {
         int httpStatus = 400, Map<String, dynamic>? json, String? body}) async {
       assert((json == null) != (body == null));
       await check(tryRequest(httpStatus: httpStatus, json: json, body: body))
-        .throws<MalformedServerResponseException>(it()
+        .throws<MalformedServerResponseException>((it) => it
           ..routeName.equals(kExampleRouteName)
           ..httpStatus.equals(httpStatus)
           ..data.deepEquals(json));
@@ -224,7 +240,7 @@ void main() {
     Future<void> check5xx({
         required int httpStatus, Map<String, dynamic>? json, String? body}) {
       return check(tryRequest(httpStatus: httpStatus, json: json, body: body))
-        .throws<Server5xxException>(it()
+        .throws<Server5xxException>((it) => it
           ..routeName.equals(kExampleRouteName)
           ..httpStatus.equals(httpStatus)
           ..data.deepEquals(json));
@@ -241,7 +257,7 @@ void main() {
     Future<void> checkMalformed({
         required int httpStatus, Map<String, dynamic>? json, String? body}) {
       return check(tryRequest(httpStatus: httpStatus, json: json, body: body))
-        .throws<MalformedServerResponseException>(it()
+        .throws<MalformedServerResponseException>((it) => it
           ..routeName.equals(kExampleRouteName)
           ..httpStatus.equals(httpStatus)
           ..data.deepEquals(json));
@@ -260,13 +276,14 @@ void main() {
       Object? Function(Map<String, dynamic>)? fromJson,
     }) {
       return check(tryRequest(json: json, body: body, fromJson: fromJson))
-        .throws<MalformedServerResponseException>(it()
+        .throws<MalformedServerResponseException>((it) => it
           ..routeName.equals(kExampleRouteName)
           ..httpStatus.equals(200)
           ..data.deepEquals(json));
     }
 
-    await check(tryRequest<Map>(json: {})).completes(it()..deepEquals({}));
+    await check(tryRequest<Map<String, dynamic>>(json: {}))
+      .completes((it) => it.deepEquals({}));
 
     await checkMalformed(body: jsonEncode([]));
     await checkMalformed(body: jsonEncode(null));
@@ -275,13 +292,89 @@ void main() {
     await checkMalformed(body: 'not JSON');
 
     await check(tryRequest(json: {'x': 'y'}, fromJson: (json) => json['x'] as String))
-      .completes(it()..equals('y'));
+      .completes((it) => it.equals('y'));
     await checkMalformed(  json: {},         fromJson: (json) => json['x'] as String);
     await checkMalformed(  json: {'x': 3},   fromJson: (json) => json['x'] as String);
   });
+
+  test('malformed API success responses: exception preserves details', () async {
+    int distinctivelyNamedFromJson(Map<String, dynamic> json) {
+      throw DistinctiveError("something is wrong");
+    }
+
+    try {
+      await tryRequest(json: {}, fromJson: distinctivelyNamedFromJson);
+      assert(false);
+    } catch (e, st) {
+      check(e).isA<MalformedServerResponseException>()
+        ..causeException.isA<DistinctiveError>()
+        ..message.contains("something is wrong");
+      check(st.toString()).contains("distinctivelyNamedFromJson");
+    }
+  });
+
+  group('ApiConnection user-agent', () {
+    Future<void> checkUserAgent(String expectedUserAgent) async {
+      return FakeApiConnection.with_(account: eg.selfAccount, useBinding: true,
+        (connection) async {
+          connection.prepare(json: {});
+          await connection.get(kExampleRouteName, (json) => json, 'example/route', null);
+          check(connection.lastRequest!).isA<http.Request>()
+            .headers['User-Agent'].equals(expectedUserAgent);
+
+          connection.prepare(json: {});
+          await connection.post(kExampleRouteName, (json) => json, 'example/route', null);
+          check(connection.lastRequest!).isA<http.Request>()
+            .headers['User-Agent'].equals(expectedUserAgent);
+
+          connection.prepare(json: {});
+          await connection.postFileFromStream(
+            kExampleRouteName,
+            (json) => json, 'example/route',
+            Stream.value([1]), 1,
+          );
+          check(connection.lastRequest!).isA<http.MultipartRequest>()
+            .headers['User-Agent'].equals(expectedUserAgent);
+
+          connection.prepare(json: {});
+          await connection.delete(kExampleRouteName, (json) => json, 'example/route', null);
+          check(connection.lastRequest!).isA<http.Request>()
+            .headers['User-Agent'].equals(expectedUserAgent);
+      });
+    }
+
+    const packageInfo = PackageInfo(version: '0.0.1', buildNumber: '1');
+
+    const testCases = [
+      ('ZulipFlutter/0.0.1+1 (Android 14)',             AndroidDeviceInfo(release: '14', sdkInt: 34),                      ),
+      ('ZulipFlutter/0.0.1+1 (iOS 17.4)',               IosDeviceInfo(systemVersion: '17.4'),                              ),
+      ('ZulipFlutter/0.0.1+1 (macOS 14.5.0)',           MacOsDeviceInfo(majorVersion: 14, minorVersion: 5, patchVersion: 0)),
+      ('ZulipFlutter/0.0.1+1 (Windows)',                WindowsDeviceInfo(),                                               ),
+      ('ZulipFlutter/0.0.1+1 (Linux; Fedora Linux 40)', LinuxDeviceInfo(name: 'Fedora Linux', versionId: '40'),            ),
+      ('ZulipFlutter/0.0.1+1 (Linux; Fedora Linux)',    LinuxDeviceInfo(name: 'Fedora Linux', versionId: null),            ),
+    ];
+
+    for (final (userAgent, deviceInfo) in testCases) {
+      test('matches $userAgent', () async {
+        testBinding.deviceInfoResult = deviceInfo;
+        testBinding.packageInfoResult = packageInfo;
+        addTearDown(testBinding.reset);
+        await checkUserAgent(userAgent);
+      });
+    }
+  });
 }
 
-Future<T> tryRequest<T>({
+class DistinctiveError extends Error {
+  final String message;
+
+  DistinctiveError(this.message);
+
+  @override
+  String toString() => message;
+}
+
+Future<T> tryRequest<T extends Object?>({
   Object? exception,
   int? httpStatus,
   Map<String, dynamic>? json,

@@ -3,6 +3,7 @@
 /// Use this file for types in the Dart SDK, as well as in other
 /// packages published by the Dart team that function as
 /// part of the Dart standard library.
+library;
 
 import 'dart:convert';
 
@@ -61,7 +62,7 @@ Object? deepToJson(Object? object) {
     case List():
       result = object.map((x) => deepToJson(x)).toList();
     case Map() when object.keys.every((k) => k is String):
-      result = object.map((k, v) => MapEntry<String, dynamic>(k, deepToJson(v)));
+      result = object.map((k, v) => MapEntry<String, dynamic>(k as String, deepToJson(v)));
     default:
       return (null, false);
   }
@@ -81,9 +82,9 @@ extension JsonChecks on Subject<Object?> {
       case null || bool() || String() || num():
         return actualJson.equals(expectedJson);
       case List():
-        return actualJson.isA<List>().deepEquals(expectedJson);
+        return actualJson.isA<List<dynamic>>().deepEquals(expectedJson);
       case Map():
-        return actualJson.isA<Map>().deepEquals(expectedJson);
+        return actualJson.isA<Map<dynamic, dynamic>>().deepEquals(expectedJson);
       case _:
         assert(false);
     }

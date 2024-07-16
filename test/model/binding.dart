@@ -1,7 +1,16 @@
+import 'dart:async';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart' hide Person;
+import 'package:flutter_local_notifications_platform_interface/flutter_local_notifications_platform_interface.dart';
+import 'package:test/fake.dart';
 import 'package:url_launcher/url_launcher.dart' as url_launcher;
+import 'package:zulip/host/android_notifications.dart';
 import 'package:zulip/model/binding.dart';
 import 'package:zulip/model/store.dart';
+import 'package:zulip/widgets/app.dart';
 
 import 'test_store.dart';
 
@@ -55,16 +64,15 @@ class TestZulipBinding extends ZulipBinding {
   /// should clean up by calling this method.  Typically this is done using
   /// [addTearDown], like `addTearDown(testBinding.reset);`.
   void reset() {
-    _globalStore?.dispose();
-    _globalStore = null;
-    assert(() {
-      _debugAlreadyLoadedStore = false;
-      return true;
-    }());
-
-    launchUrlResult = true;
-    _launchUrlCalls = null;
-    deviceInfoResult = _defaultDeviceInfoResult;
+    ZulipApp.debugReset();
+    _resetStore();
+    _resetCanLaunchUrl();
+    _resetLaunchUrl();
+    _resetCloseInAppWebView();
+    _resetDeviceInfo();
+    _resetPackageInfo();
+    _resetFirebase();
+    _resetNotifications();
   }
 
   /// The current global store offered to a [GlobalStoreWidget].
@@ -79,6 +87,15 @@ class TestZulipBinding extends ZulipBinding {
   TestGlobalStore? _globalStore;
 
   bool _debugAlreadyLoadedStore = false;
+
+  void _resetStore() {
+    _globalStore?.dispose();
+    _globalStore = null;
+    assert(() {
+      _debugAlreadyLoadedStore = false;
+      return true;
+    }());
+  }
 
   @override
   Future<GlobalStore> loadGlobalStore() {
@@ -105,10 +122,45 @@ class TestZulipBinding extends ZulipBinding {
     return Future.value(globalStore);
   }
 
+  /// The value that `ZulipBinding.instance.canLaunchUrl()` should return.
+  ///
+  /// See also [takeCanLaunchUrlCalls].
+  bool canLaunchUrlResult = true;
+
+  void _resetCanLaunchUrl() {
+    canLaunchUrlResult = true;
+    _canLaunchUrlCalls = null;
+  }
+
+  /// Consume the log of calls made to `ZulipBinding.instance.canLaunchUrl()`.
+  ///
+  /// This returns a list of the arguments to all calls made
+  /// to `ZulipBinding.instance.canLaunchUrl()` since the last call to
+  /// either this method or [reset].
+  ///
+  /// See also [canLaunchUrlResult].
+  List<Uri> takeCanLaunchUrlCalls() {
+    final result = _canLaunchUrlCalls;
+    _canLaunchUrlCalls = null;
+    return result ?? [];
+  }
+  List<Uri>? _canLaunchUrlCalls;
+
+  @override
+  Future<bool> canLaunchUrl(Uri url) async {
+    (_canLaunchUrlCalls ??= []).add(url);
+    return canLaunchUrlResult;
+  }
+
   /// The value that `ZulipBinding.instance.launchUrl()` should return.
   ///
   /// See also [takeLaunchUrlCalls].
   bool launchUrlResult = true;
+
+  void _resetLaunchUrl() {
+    launchUrlResult = true;
+    _launchUrlCalls = null;
+  }
 
   /// Consume the log of calls made to `ZulipBinding.instance.launchUrl()`.
   ///
@@ -133,14 +185,408 @@ class TestZulipBinding extends ZulipBinding {
     return launchUrlResult;
   }
 
-  /// The value that `ZulipBinding.instance.deviceInfo()` should return.
-  ///
-  /// See also [takeDeviceInfoCalls].
-  BaseDeviceInfo deviceInfoResult = _defaultDeviceInfoResult;
-  static final _defaultDeviceInfoResult = AndroidDeviceInfo(sdkInt: 33);
+  @override
+  Future<bool> supportsCloseForLaunchMode(url_launcher.LaunchMode mode) async => true;
+
+  void _resetCloseInAppWebView() {
+    _closeInAppWebViewCallCount = 0;
+  }
+
+  /// Read and reset the count of calls to `ZulipBinding.instance.closeInAppWebView()`.
+  int takeCloseInAppWebViewCallCount() {
+    final result = _closeInAppWebViewCallCount;
+    _closeInAppWebViewCallCount = 0;
+    return result;
+  }
+  int _closeInAppWebViewCallCount = 0;
 
   @override
-  Future<BaseDeviceInfo> deviceInfo() {
-    return Future(() => deviceInfoResult);
+  Future<void> closeInAppWebView() async {
+    _closeInAppWebViewCallCount++;
+  }
+
+  /// The value that `ZulipBinding.instance.deviceInfo` should return.
+  BaseDeviceInfo deviceInfoResult = _defaultDeviceInfoResult;
+  static const _defaultDeviceInfoResult = AndroidDeviceInfo(sdkInt: 33, release: '13');
+
+  void _resetDeviceInfo() {
+    deviceInfoResult = _defaultDeviceInfoResult;
+  }
+
+  @override
+  Future<BaseDeviceInfo?> get deviceInfo async => deviceInfoResult;
+
+  @override
+  BaseDeviceInfo? get syncDeviceInfo => deviceInfoResult;
+
+  /// The value that `ZulipBinding.instance.packageInfo` should return.
+  PackageInfo packageInfoResult = _defaultPackageInfo;
+  static const _defaultPackageInfo = PackageInfo(version: '0.0.1', buildNumber: '1');
+
+  void _resetPackageInfo() {
+    packageInfoResult = _defaultPackageInfo;
+  }
+
+  @override
+  Future<PackageInfo?> get packageInfo async => packageInfoResult;
+
+  @override
+  PackageInfo? get syncPackageInfo => packageInfoResult;
+
+  void _resetFirebase() {
+    _firebaseInitialized = false;
+    _firebaseMessaging = null;
+  }
+
+  bool _firebaseInitialized = false;
+  FakeFirebaseMessaging? _firebaseMessaging;
+
+  @override
+  Future<void> firebaseInitializeApp({required FirebaseOptions options}) async {
+    _firebaseInitialized = true;
+  }
+
+  /// The value `firebaseMessaging.getToken` will initialize the token to.
+  ///
+  /// After `firebaseMessaging.getToken` has been called once, this has no effect.
+  set firebaseMessagingInitialToken(String value) {
+    (_firebaseMessaging ??= FakeFirebaseMessaging())._initialToken = value;
+  }
+
+  @override
+  FakeFirebaseMessaging get firebaseMessaging {
+    assert(_firebaseInitialized);
+    return (_firebaseMessaging ??= FakeFirebaseMessaging());
+  }
+
+  @override
+  Stream<RemoteMessage> get firebaseMessagingOnMessage => firebaseMessaging.onMessage.stream;
+
+  @override
+  void firebaseMessagingOnBackgroundMessage(BackgroundMessageHandler handler) {
+    firebaseMessaging.onBackgroundMessage.stream.listen(handler);
+  }
+
+  void _resetNotifications() {
+    _notificationsPlugin = null;
+    _androidNotificationHostApi = null;
+  }
+
+  FakeFlutterLocalNotificationsPlugin? _notificationsPlugin;
+
+  @override
+  FakeFlutterLocalNotificationsPlugin get notifications {
+    return (_notificationsPlugin ??= FakeFlutterLocalNotificationsPlugin());
+  }
+
+  FakeAndroidNotificationHostApi? _androidNotificationHostApi;
+
+  @override
+  FakeAndroidNotificationHostApi get androidNotificationHost {
+    return (_androidNotificationHostApi ??= FakeAndroidNotificationHostApi());
   }
 }
+
+class FakeFirebaseMessaging extends Fake implements FirebaseMessaging {
+  ////////////////////////////////
+  // Permissions.
+
+  NotificationSettings requestPermissionResult = const NotificationSettings(
+    alert: AppleNotificationSetting.enabled,
+    announcement: AppleNotificationSetting.disabled,
+    authorizationStatus: AuthorizationStatus.authorized,
+    badge: AppleNotificationSetting.enabled,
+    carPlay: AppleNotificationSetting.disabled,
+    lockScreen: AppleNotificationSetting.enabled,
+    notificationCenter: AppleNotificationSetting.enabled,
+    showPreviews: AppleShowPreviewSetting.whenAuthenticated,
+    timeSensitive: AppleNotificationSetting.disabled,
+    criticalAlert: AppleNotificationSetting.disabled,
+    sound: AppleNotificationSetting.enabled,
+  );
+
+  List<FirebaseMessagingRequestPermissionCall> takeRequestPermissionCalls() {
+    final result = _requestPermissionCalls;
+    _requestPermissionCalls = [];
+    return result;
+  }
+  List<FirebaseMessagingRequestPermissionCall> _requestPermissionCalls = [];
+
+  @override
+  Future<NotificationSettings> requestPermission({
+    bool alert = true,
+    bool announcement = false,
+    bool badge = true,
+    bool carPlay = false,
+    bool criticalAlert = false,
+    bool provisional = false,
+    bool sound = true,
+  }) async {
+    _requestPermissionCalls.add((
+      alert: alert,
+      announcement: announcement,
+      badge: badge,
+      carPlay: carPlay,
+      criticalAlert: criticalAlert,
+      provisional: provisional,
+      sound: sound,
+    ));
+    return requestPermissionResult;
+  }
+
+  ////////////////////////////////
+  // Tokens.
+
+  String? _initialToken;
+
+  /// Set the token to a new value, as if it were newly generated.
+  ///
+  /// This will cause listeners of [onTokenRefresh] to be called, but
+  /// in a microtask, not synchronously.
+  void setToken(String value) {
+    _token = value;
+    _tokenController.add(value);
+  }
+
+  String? _token;
+
+  final StreamController<String> _tokenController =
+    StreamController<String>.broadcast();
+
+  @override
+  Future<String?> getToken({String? vapidKey}) async {
+    assert(vapidKey == null);
+    if (_token == null) {
+      assert(_initialToken != null,
+        'Tests that call [NotificationService.start], or otherwise cause'
+        ' a call to `ZulipBinding.instance.firebaseMessaging.getToken`,'
+        ' must set `testBinding.firebaseMessagingInitialToken` first.');
+
+      // This causes [onTokenRefresh] to fire, just like the real [getToken]
+      // does when no token exists (e.g., on first run after install).
+      setToken(_initialToken!);
+    }
+    return _token;
+  }
+
+  @override
+  Stream<String> get onTokenRefresh => _tokenController.stream;
+
+  @override
+  Future<String?> getAPNSToken() async {
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.iOS:
+      case TargetPlatform.macOS:
+        // In principle the APNs token is unrelated to any FCM token.
+        // But for tests it's convenient to have just one version of
+        // [TestBinding.firebaseMessagingInitialToken].
+        return _initialToken;
+
+      case TargetPlatform.android:
+      case TargetPlatform.linux:
+      case TargetPlatform.windows:
+      case TargetPlatform.fuchsia:
+        return null;
+    }
+  }
+
+  ////////////////////////////////
+  // Messages.
+
+  StreamController<RemoteMessage> onMessage = StreamController.broadcast();
+
+  /// Controls [TestZulipBinding.firebaseMessagingOnBackgroundMessage].
+  ///
+  /// Calling [StreamController.add] on this will cause a call
+  /// to any handler registered through that method.
+  StreamController<RemoteMessage> onBackgroundMessage = StreamController.broadcast();
+}
+
+typedef FirebaseMessagingRequestPermissionCall = ({
+  bool alert,
+  bool announcement,
+  bool badge,
+  bool carPlay,
+  bool criticalAlert,
+  bool provisional,
+  bool sound,
+});
+
+class FakeFlutterLocalNotificationsPlugin extends Fake implements FlutterLocalNotificationsPlugin {
+  InitializationSettings? initializationSettings;
+  DidReceiveNotificationResponseCallback? onDidReceiveNotificationResponse;
+  DidReceiveBackgroundNotificationResponseCallback? onDidReceiveBackgroundNotificationResponse;
+
+  @override
+  Future<bool?> initialize(
+    InitializationSettings initializationSettings, {
+    DidReceiveNotificationResponseCallback? onDidReceiveNotificationResponse,
+    DidReceiveBackgroundNotificationResponseCallback? onDidReceiveBackgroundNotificationResponse,
+  }) async {
+    assert(this.initializationSettings == null);
+    this.initializationSettings = initializationSettings;
+    this.onDidReceiveNotificationResponse = onDidReceiveNotificationResponse;
+    this.onDidReceiveBackgroundNotificationResponse = onDidReceiveBackgroundNotificationResponse;
+    return true;
+  }
+
+  FlutterLocalNotificationsPlatform? _platform;
+
+  @override
+  T? resolvePlatformSpecificImplementation<T extends FlutterLocalNotificationsPlatform>() {
+    // This follows the logic of the base class's implementation,
+    // but supplies our fakes for the per-platform classes.
+    assert(initializationSettings != null);
+    assert(T != FlutterLocalNotificationsPlatform);
+    if (kIsWeb) return null;
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+        assert(_platform == null || _platform is FakeAndroidFlutterLocalNotificationsPlugin);
+        if (T != AndroidFlutterLocalNotificationsPlugin) return null;
+        return (_platform ??= FakeAndroidFlutterLocalNotificationsPlugin()) as T?;
+
+      case TargetPlatform.iOS:
+        assert(_platform == null || _platform is FakeIOSFlutterLocalNotificationsPlugin);
+        if (T != IOSFlutterLocalNotificationsPlugin) return null;
+        return (_platform ??= FakeIOSFlutterLocalNotificationsPlugin()) as T?;
+
+      case TargetPlatform.linux:
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+      case TargetPlatform.fuchsia:
+        return null;
+    }
+  }
+
+  /// The value to be returned by [getNotificationAppLaunchDetails].
+  NotificationAppLaunchDetails? appLaunchDetails;
+
+  @override
+  Future<NotificationAppLaunchDetails?> getNotificationAppLaunchDetails() {
+    return Future.value(appLaunchDetails);
+  }
+
+  void receiveNotificationResponse(NotificationResponse details) {
+    if (onDidReceiveNotificationResponse != null) {
+      onDidReceiveNotificationResponse!(details);
+    }
+  }
+}
+
+class FakeAndroidFlutterLocalNotificationsPlugin extends Fake implements AndroidFlutterLocalNotificationsPlugin {
+  /// Consume the log of calls made to [createNotificationChannel].
+  ///
+  /// This returns a list of the arguments to all calls made
+  /// to [createNotificationChannel] since the last call to this method.
+  List<AndroidNotificationChannel> takeCreatedChannels() {
+    final result = _createdChannels;
+    _createdChannels = [];
+    return result;
+  }
+  List<AndroidNotificationChannel> _createdChannels = [];
+
+  @override
+  Future<void> createNotificationChannel(AndroidNotificationChannel notificationChannel) async {
+    _createdChannels.add(notificationChannel);
+  }
+}
+
+class FakeIOSFlutterLocalNotificationsPlugin extends Fake implements IOSFlutterLocalNotificationsPlugin {
+}
+
+class FakeAndroidNotificationHostApi implements AndroidNotificationHostApi {
+  /// Consume the log of calls made to [notify].
+  ///
+  /// This returns a list of the arguments to all calls made
+  /// to [notify] since the last call to this method.
+  List<AndroidNotificationHostApiNotifyCall> takeNotifyCalls() {
+    final result = _notifyCalls;
+    _notifyCalls = [];
+    return result;
+  }
+  List<AndroidNotificationHostApiNotifyCall> _notifyCalls = [];
+
+  final Map<String, MessagingStyle?> _activeNotificationsMessagingStyle = {};
+
+  /// Clears all active notifications that have been created via [notify].
+  void clearActiveNotifications() {
+    _activeNotificationsMessagingStyle.clear();
+  }
+
+  @override
+  Future<void> notify({
+    String? tag,
+    required int id,
+    bool? autoCancel,
+    required String channelId,
+    int? color,
+    PendingIntent? contentIntent,
+    String? contentText,
+    String? contentTitle,
+    Map<String?, String?>? extras,
+    String? groupKey,
+    InboxStyle? inboxStyle,
+    bool? isGroupSummary,
+    MessagingStyle? messagingStyle,
+    int? number,
+    String? smallIconResourceName,
+  }) async {
+    _notifyCalls.add((
+      tag: tag,
+      id: id,
+      autoCancel: autoCancel,
+      channelId: channelId,
+      color: color,
+      contentIntent: contentIntent,
+      contentText: contentText,
+      contentTitle: contentTitle,
+      extras: extras,
+      groupKey: groupKey,
+      inboxStyle: inboxStyle,
+      isGroupSummary: isGroupSummary,
+      messagingStyle: messagingStyle,
+      number: number,
+      smallIconResourceName: smallIconResourceName,
+    ));
+
+    if (tag != null) {
+      _activeNotificationsMessagingStyle[tag] = messagingStyle == null
+        ? null
+        : MessagingStyle(
+            user: messagingStyle.user,
+            conversationTitle: messagingStyle.conversationTitle,
+            isGroupConversation: messagingStyle.isGroupConversation,
+            messages: messagingStyle.messages.map((message) =>
+              MessagingStyleMessage(
+                text: message!.text,
+                timestampMs: message.timestampMs,
+                person: Person(
+                  key: message.person.key,
+                  name: message.person.name,
+                  iconBitmap: null)),
+            ).toList());
+    }
+  }
+
+  @override
+  Future<MessagingStyle?> getActiveNotificationMessagingStyleByTag(String tag) async =>
+    _activeNotificationsMessagingStyle[tag];
+}
+
+typedef AndroidNotificationHostApiNotifyCall = ({
+  String? tag,
+  int id,
+  bool? autoCancel,
+  String channelId,
+  int? color,
+  PendingIntent? contentIntent,
+  String? contentText,
+  String? contentTitle,
+  Map<String?, String?>? extras,
+  String? groupKey,
+  InboxStyle? inboxStyle,
+  bool? isGroupSummary,
+  MessagingStyle? messagingStyle,
+  int? number,
+  String? smallIconResourceName,
+});

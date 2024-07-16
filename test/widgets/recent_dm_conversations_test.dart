@@ -1,6 +1,7 @@
 import 'package:checks/checks.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zulip/api/model/events.dart';
 import 'package:zulip/api/model/model.dart';
@@ -13,6 +14,7 @@ import 'package:zulip/widgets/recent_dm_conversations.dart';
 import 'package:zulip/widgets/store.dart';
 
 import '../example_data.dart' as eg;
+import '../flutter_checks.dart';
 import '../model/binding.dart';
 import '../model/test_store.dart';
 import '../test_navigation.dart';
@@ -31,23 +33,25 @@ Future<void> setupPage(WidgetTester tester, {
   await testBinding.globalStore.add(eg.selfAccount, eg.initialSnapshot());
   final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
 
-  store.addUser(eg.selfUser);
+  await store.addUser(eg.selfUser);
   for (final user in users) {
-    store.addUser(user);
+    await store.addUser(user);
   }
 
   for (final dmMessage in dmMessages) {
-    store.handleEvent(MessageEvent(id: 1, message: dmMessage));
+    await store.handleEvent(MessageEvent(id: 1, message: dmMessage));
   }
 
   if (newNameForSelfUser != null) {
-    store.handleEvent(RealmUserUpdateEvent(id: 1, userId: eg.selfUser.userId,
+    await store.handleEvent(RealmUserUpdateEvent(id: 1, userId: eg.selfUser.userId,
       fullName: newNameForSelfUser));
   }
 
   await tester.pumpWidget(
     GlobalStoreWidget(
       child: MaterialApp(
+        localizationsDelegates: ZulipLocalizations.localizationsDelegates,
+        supportedLocales: ZulipLocalizations.supportedLocales,
         navigatorObservers: navigatorObserver != null ? [navigatorObserver] : [],
         home: PerAccountStoreWidget(
           accountId: eg.selfAccount.id,
@@ -61,12 +65,9 @@ void main() {
   TestZulipBinding.ensureInitialized();
 
   group('RecentDmConversationsPage', () {
-    Finder findConversationItem(Narrow narrow) {
-      return find.byWidgetPredicate(
-            (widget) =>
-        widget is RecentDmConversationsItem && widget.narrow == narrow,
-      );
-    }
+    Finder findConversationItem(Narrow narrow) => find.byWidgetPredicate(
+      (widget) => widget is RecentDmConversationsItem && widget.narrow == narrow,
+    );
 
     testWidgets('page builds; conversations appear in order', (WidgetTester tester) async {
       final user1 = eg.user(userId: 1);
@@ -92,7 +93,7 @@ void main() {
       for (int i = 0; i < 30; i++) {
         final user = eg.user(userId: i, fullName: 'User ${i.toString()}');
         users.add(user);
-        messages.add(eg.dmMessage(id: i, from: eg.selfUser, to: [user]));
+        messages.add(eg.dmMessage(from: eg.selfUser, to: [user]));
       }
 
       await setupPage(tester, users: users, dmMessages: messages);
@@ -109,7 +110,7 @@ void main() {
   });
 
   group('RecentDmConversationsItem', () {
-    group('appearance', () {
+    group('content/appearance', () {
       void checkAvatar(WidgetTester tester, DmNarrow narrow) {
         final shape = tester.widget<AvatarShape>(
           find.descendant(
@@ -148,8 +149,28 @@ void main() {
         }
       }
 
+      Future<void> markMessageAsRead(WidgetTester tester, Message message) async {
+        final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+        await store.handleEvent(UpdateMessageFlagsAddEvent(
+          id: 1, flag: MessageFlag.read, all: false, messages: [message.id]));
+        await tester.pump();
+      }
+
+      void checkUnreadCount(WidgetTester tester, int expectedCount) {
+        final Text? textWidget = tester.widgetList<Text>(find.descendant(
+          of: find.byType(RecentDmConversationsItem),
+          matching: find.textContaining(RegExp(r'^\d+$'),
+        ))).singleOrNull;
+
+        if (expectedCount == 0) {
+          check(textWidget).isNull();
+        } else {
+          check(textWidget).isNotNull().data.equals(expectedCount.toString());
+        }
+      }
+
       group('self-1:1', () {
-        testWidgets('has right content', (WidgetTester tester) async {
+        testWidgets('has right title/avatar', (WidgetTester tester) async {
           final message = eg.dmMessage(from: eg.selfUser, to: []);
           await setupPage(tester, users: [], dmMessages: [message]);
 
@@ -172,10 +193,19 @@ void main() {
             newNameForSelfUser: name);
           checkTitle(tester, name, 2);
         });
+
+        testWidgets('unread counts', (WidgetTester tester) async {
+          final message = eg.dmMessage(from: eg.selfUser, to: []);
+          await setupPage(tester, users: [], dmMessages: [message]);
+
+          checkUnreadCount(tester, 1);
+          await markMessageAsRead(tester, message);
+          checkUnreadCount(tester, 0);
+        });
       });
 
       group('1:1', () {
-        testWidgets('has right content', (WidgetTester tester) async {
+        testWidgets('has right title/avatar', (WidgetTester tester) async {
           final user = eg.user(userId: 1);
           final message = eg.dmMessage(from: eg.selfUser, to: [user]);
           await setupPage(tester, users: [user], dmMessages: [message]);
@@ -209,6 +239,15 @@ void main() {
           await setupPage(tester, users: [user], dmMessages: [message]);
           checkTitle(tester, user.fullName, 2);
         });
+
+        testWidgets('unread counts', (WidgetTester tester) async {
+          final message = eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]);
+          await setupPage(tester, users: [], dmMessages: [message]);
+
+          checkUnreadCount(tester, 1);
+          await markMessageAsRead(tester, message);
+          checkUnreadCount(tester, 0);
+        });
       });
 
       group('group', () {
@@ -220,7 +259,7 @@ void main() {
           return result;
         }
 
-        testWidgets('has right content', (WidgetTester tester) async {
+        testWidgets('has right title/avatar', (WidgetTester tester) async {
           final users = usersList(2);
           final user0 = users[0];
           final user1 = users[1];
@@ -258,6 +297,15 @@ void main() {
           await setupPage(tester, users: users, dmMessages: [message]);
           checkTitle(tester, users.map((u) => u.fullName).join(', '), 2);
         });
+
+        testWidgets('unread counts', (WidgetTester tester) async {
+          final message = eg.dmMessage(from: eg.thirdUser, to: [eg.selfUser, eg.otherUser]);
+          await setupPage(tester, users: [], dmMessages: [message]);
+
+          checkUnreadCount(tester, 1);
+          await markMessageAsRead(tester, message);
+          checkUnreadCount(tester, 0);
+        });
       });
     });
 
@@ -286,19 +334,19 @@ void main() {
       testWidgets('1:1', (WidgetTester tester) async {
         final user = eg.user(userId: 1, fullName: 'User 1');
         await runAndCheck(tester, users: [user],
-          message: eg.dmMessage(id: 1, from: eg.selfUser, to: [user]));
+          message: eg.dmMessage(from: eg.selfUser, to: [user]));
       });
 
       testWidgets('self-1:1', (WidgetTester tester) async {
         await runAndCheck(tester, users: [],
-          message: eg.dmMessage(id: 1, from: eg.selfUser, to: []));
+          message: eg.dmMessage(from: eg.selfUser, to: []));
       });
 
       testWidgets('group', (WidgetTester tester) async {
         final user1 = eg.user(userId: 1, fullName: 'User 1');
         final user2 = eg.user(userId: 2, fullName: 'User 2');
         await runAndCheck(tester, users: [user1, user2],
-          message: eg.dmMessage(id: 1, from: eg.selfUser, to: [user1, user2]));
+          message: eg.dmMessage(from: eg.selfUser, to: [user1, user2]));
       });
     });
   });

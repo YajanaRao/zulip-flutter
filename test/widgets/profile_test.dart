@@ -1,5 +1,4 @@
 import 'package:checks/checks.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -12,6 +11,7 @@ import 'package:zulip/widgets/message_list.dart';
 import 'package:zulip/widgets/page.dart';
 import 'package:zulip/widgets/profile.dart';
 import 'package:zulip/widgets/store.dart';
+import 'package:zulip/widgets/theme.dart';
 
 import '../example_data.dart' as eg;
 import '../model/binding.dart';
@@ -36,20 +36,21 @@ Future<void> setupPage(WidgetTester tester, {
   await testBinding.globalStore.add(eg.selfAccount, initialSnapshot);
   final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
 
-  store.addUser(eg.selfUser);
+  await store.addUser(eg.selfUser);
   if (users != null) {
-    store.addUsers(users);
+    await store.addUsers(users);
   }
 
   await tester.pumpWidget(
-    GlobalStoreWidget(
-      child: MaterialApp(
+    GlobalStoreWidget(child: Builder(builder: (context) =>
+      MaterialApp(
+        theme: zulipThemeData(context),
         navigatorObservers: navigatorObserver != null ? [navigatorObserver] : [],
         localizationsDelegates: ZulipLocalizations.localizationsDelegates,
         supportedLocales: ZulipLocalizations.supportedLocales,
         home: PerAccountStoreWidget(
           accountId: eg.selfAccount.id,
-          child: ProfilePage(userId: pageUserId)))));
+          child: ProfilePage(userId: pageUserId))))));
 
   // global store, per-account store, and page get loaded
   await tester.pumpAndSettle();
@@ -167,10 +168,10 @@ void main() {
       );
 
       await tester.tap(find.text(testUrl));
-      final expectedMode = defaultTargetPlatform == TargetPlatform.android ?
-        LaunchMode.externalApplication : LaunchMode.platformDefault;
-      check(testBinding.takeLaunchUrlCalls())
-        .single.equals((url: Uri.parse(testUrl), mode: expectedMode));
+      check(testBinding.takeLaunchUrlCalls()).single.equals((
+        url: Uri.parse(testUrl),
+        mode: LaunchMode.platformDefault,
+      ));
     });
 
     testWidgets('page builds; external link type navigates away', (WidgetTester tester) async {
@@ -194,10 +195,10 @@ void main() {
       );
 
       await tester.tap(find.text('externalValue'));
-      final expectedMode = defaultTargetPlatform == TargetPlatform.android ?
-        LaunchMode.externalApplication : LaunchMode.platformDefault;
-      check(testBinding.takeLaunchUrlCalls())
-        .single.equals((url: Uri.parse('http://example/externalValue'), mode: expectedMode));
+      check(testBinding.takeLaunchUrlCalls()).single.equals((
+        url: Uri.parse('http://example/externalValue'),
+        mode: LaunchMode.platformDefault,
+      ));
     });
 
     testWidgets('page builds; user links to profile', (WidgetTester tester) async {

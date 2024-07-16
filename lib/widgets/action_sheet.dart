@@ -6,10 +6,13 @@ import 'package:share_plus/share_plus.dart';
 import '../api/exception.dart';
 import '../api/model/model.dart';
 import '../api/route/messages.dart';
+import '../model/internal_link.dart';
+import '../model/narrow.dart';
 import 'clipboard.dart';
 import 'compose_box.dart';
 import 'dialog.dart';
 import 'draggable_scrollable_modal_bottom_sheet.dart';
+import 'icons.dart';
 import 'message_list.dart';
 import 'store.dart';
 
@@ -17,21 +20,34 @@ import 'store.dart';
 ///
 /// Must have a [MessageListPage] ancestor.
 void showMessageActionSheet({required BuildContext context, required Message message}) {
+  final store = PerAccountStoreWidget.of(context);
+
   // The UI that's conditioned on this won't live-update during this appearance
   // of the action sheet (we avoid calling composeBoxControllerOf in a build
   // method; see its doc). But currently it will be constant through the life of
   // any message list, so that's fine.
   final isComposeBoxOffered = MessageListPage.composeBoxControllerOf(context) != null;
-  showDraggableScrollableModalBottomSheet(
+
+  final hasThumbsUpReactionVote = message.reactions
+    ?.aggregated.any((reactionWithVotes) =>
+      reactionWithVotes.reactionType == ReactionType.unicodeEmoji
+      && reactionWithVotes.emojiCode == '1f44d'
+      && reactionWithVotes.userIds.contains(store.selfUserId))
+    ?? false;
+
+  showDraggableScrollableModalBottomSheet<void>(
     context: context,
     builder: (BuildContext _) {
       return Column(children: [
-        ShareButton(message: message, messageListContext: context),
+        if (!hasThumbsUpReactionVote) AddThumbsUpButton(message: message, messageListContext: context),
+        StarButton(message: message, messageListContext: context),
         if (isComposeBoxOffered) QuoteAndReplyButton(
           message: message,
           messageListContext: context,
         ),
-        CopyButton(message: message, messageListContext: context),
+        CopyMessageTextButton(message: message, messageListContext: context),
+        CopyMessageLinkButton(message: message, messageListContext: context),
+        ShareButton(message: message, messageListContext: context),
       ]);
     });
 }
@@ -45,7 +61,7 @@ abstract class MessageActionSheetMenuItemButton extends StatelessWidget {
 
   IconData get icon;
   String label(ZulipLocalizations zulipLocalizations);
-  void Function(BuildContext) get onPressed;
+  void onPressed(BuildContext context);
 
   final Message message;
   final BuildContext messageListContext;
@@ -60,39 +76,95 @@ abstract class MessageActionSheetMenuItemButton extends StatelessWidget {
   }
 }
 
-class ShareButton extends MessageActionSheetMenuItemButton {
-  ShareButton({
+// This button is very temporary, to complete #125 before we have a way to
+// choose an arbitrary reaction (#388). So, skipping i18n.
+class AddThumbsUpButton extends MessageActionSheetMenuItemButton {
+  AddThumbsUpButton({
     super.key,
     required super.message,
     required super.messageListContext,
   });
 
-  @override get icon => Icons.adaptive.share;
+  @override IconData get icon => Icons.add_reaction_outlined;
 
   @override
   String label(ZulipLocalizations zulipLocalizations) {
-    return zulipLocalizations.actionSheetOptionShare;
+    return 'React with 👍'; // TODO(i18n) skip translation for now
   }
 
-  @override get onPressed => (BuildContext context) async {
-    // Close the message action sheet; we're about to show the share
-    // sheet. (We could do this after the sharing Future settles, but
-    // on iOS I get impatient with how slowly our action sheet
-    // dismisses in that case.)
-    // TODO(#24): Fix iOS bug where this call causes the keyboard to
-    //   reopen (if it was open at the time of this
-    //   `showMessageActionSheet` call) and cover a large part of the
-    //   share sheet.
+  @override void onPressed(BuildContext context) async {
     Navigator.of(context).pop();
+    String? errorMessage;
+    try {
+      await addReaction(PerAccountStoreWidget.of(messageListContext).connection,
+        messageId: message.id,
+        reactionType: ReactionType.unicodeEmoji,
+        emojiCode: '1f44d',
+        emojiName: '+1',
+      );
+    } catch (e) {
+      if (!messageListContext.mounted) return;
 
-    // TODO: to support iPads, we're asked to give a
-    //   `sharePositionOrigin` param, or risk crashing / hanging:
-    //     https://pub.dev/packages/share_plus#ipad
-    //   Perhaps a wart in the API; discussion:
-    //     https://github.com/zulip/zulip-flutter/pull/12#discussion_r1130146231
-    // TODO: Share raw Markdown, not HTML
-    await Share.shareWithResult(message.content);
-  };
+      switch (e) {
+        case ZulipApiException():
+          errorMessage = e.message;
+          // TODO(#741) specific messages for common errors, like network errors
+          //   (support with reusable code)
+        default:
+      }
+
+      await showErrorDialog(context: context,
+        title: 'Adding reaction failed', message: errorMessage);
+    }
+  }
+}
+
+class StarButton extends MessageActionSheetMenuItemButton {
+  StarButton({
+    super.key,
+    required super.message,
+    required super.messageListContext,
+  });
+
+  @override IconData get icon => ZulipIcons.star_filled;
+
+  @override
+  String label(ZulipLocalizations zulipLocalizations) {
+    return message.flags.contains(MessageFlag.starred)
+      ? zulipLocalizations.actionSheetOptionUnstarMessage
+      : zulipLocalizations.actionSheetOptionStarMessage;
+  }
+
+  @override void onPressed(BuildContext context) async {
+    Navigator.of(context).pop();
+    final zulipLocalizations = ZulipLocalizations.of(messageListContext);
+    final op = message.flags.contains(MessageFlag.starred)
+      ? UpdateMessageFlagsOp.remove
+      : UpdateMessageFlagsOp.add;
+
+    try {
+      final connection = PerAccountStoreWidget.of(messageListContext).connection;
+      await updateMessageFlags(connection, messages: [message.id],
+        op: op, flag: MessageFlag.starred);
+    } catch (e) {
+      if (!messageListContext.mounted) return;
+
+      String? errorMessage;
+      switch (e) {
+        case ZulipApiException():
+          errorMessage = e.message;
+          // TODO specific messages for common errors, like network errors
+          //   (support with reusable code)
+        default:
+      }
+
+      await showErrorDialog(context: messageListContext,
+        title: switch(op) {
+          UpdateMessageFlagsOp.remove => zulipLocalizations.errorUnstarMessageFailedTitle,
+          UpdateMessageFlagsOp.add    => zulipLocalizations.errorStarMessageFailedTitle,
+        }, message: errorMessage);
+    }
+  }
 }
 
 /// Fetch and return the raw Markdown content for [messageId],
@@ -150,17 +222,17 @@ class QuoteAndReplyButton extends MessageActionSheetMenuItemButton {
     required super.messageListContext,
   });
 
-  @override get icon => Icons.format_quote_outlined;
+  @override IconData get icon => Icons.format_quote_outlined;
 
   @override
   String label(ZulipLocalizations zulipLocalizations) {
     return zulipLocalizations.actionSheetOptionQuoteAndReply;
   }
 
-  @override get onPressed => (BuildContext bottomSheetContext) async {
+  @override void onPressed(BuildContext context) async {
     // Close the message action sheet. We'll show the request progress
     // in the compose-box content input with a "[Quoting…]" placeholder.
-    Navigator.of(bottomSheetContext).pop();
+    Navigator.of(context).pop();
     final zulipLocalizations = ZulipLocalizations.of(messageListContext);
 
     // This will be null only if the compose box disappeared after the
@@ -174,7 +246,7 @@ class QuoteAndReplyButton extends MessageActionSheetMenuItemButton {
       && topicController.textNormalized == kNoTopicTopic
       && message is StreamMessage
     ) {
-      topicController.value = TextEditingValue(text: message.subject);
+      topicController.value = TextEditingValue(text: message.topic);
     }
     final tag = composeBoxController.contentController
       .registerQuoteAndReplyStart(PerAccountStoreWidget.of(messageListContext),
@@ -201,24 +273,24 @@ class QuoteAndReplyButton extends MessageActionSheetMenuItemButton {
     if (!composeBoxController.contentFocusNode.hasFocus) {
       composeBoxController.contentFocusNode.requestFocus();
     }
-  };
+  }
 }
 
-class CopyButton extends MessageActionSheetMenuItemButton {
-  CopyButton({
+class CopyMessageTextButton extends MessageActionSheetMenuItemButton {
+  CopyMessageTextButton({
     super.key,
     required super.message,
     required super.messageListContext,
   });
 
-  @override get icon => Icons.copy;
+  @override IconData get icon => Icons.copy;
 
   @override
   String label(ZulipLocalizations zulipLocalizations) {
-    return zulipLocalizations.actionSheetOptionCopy;
+    return zulipLocalizations.actionSheetOptionCopyMessageText;
   }
 
-  @override get onPressed => (BuildContext context) async {
+  @override void onPressed(BuildContext context) async {
     // Close the message action sheet. We won't be showing request progress,
     // but hopefully it won't take long at all, and
     // fetchRawContentWithFeedback has a TODO for giving feedback if it does.
@@ -235,8 +307,96 @@ class CopyButton extends MessageActionSheetMenuItemButton {
 
     if (!messageListContext.mounted) return;
 
-    copyWithPopup(context: context,
-      successContent: Text(zulipLocalizations.successMessageCopied),
+    copyWithPopup(context: messageListContext,
+      successContent: Text(zulipLocalizations.successMessageTextCopied),
       data: ClipboardData(text: rawContent));
-  };
+  }
+}
+
+class CopyMessageLinkButton extends MessageActionSheetMenuItemButton {
+  CopyMessageLinkButton({
+    super.key,
+    required super.message,
+    required super.messageListContext,
+  });
+
+  @override IconData get icon => Icons.link;
+
+  @override
+  String label(ZulipLocalizations zulipLocalizations) {
+    return zulipLocalizations.actionSheetOptionCopyMessageLink;
+  }
+
+  @override void onPressed(BuildContext context) {
+    Navigator.of(context).pop();
+    final zulipLocalizations = ZulipLocalizations.of(messageListContext);
+
+    final store = PerAccountStoreWidget.of(messageListContext);
+    final messageLink = narrowLink(
+      store,
+      SendableNarrow.ofMessage(message, selfUserId: store.selfUserId),
+      nearMessageId: message.id,
+    );
+
+    copyWithPopup(context: messageListContext,
+      successContent: Text(zulipLocalizations.successMessageLinkCopied),
+      data: ClipboardData(text: messageLink.toString()));
+  }
+}
+
+class ShareButton extends MessageActionSheetMenuItemButton {
+  ShareButton({
+    super.key,
+    required super.message,
+    required super.messageListContext,
+  });
+
+  @override IconData get icon => Icons.adaptive.share;
+
+  @override
+  String label(ZulipLocalizations zulipLocalizations) {
+    return zulipLocalizations.actionSheetOptionShare;
+  }
+
+  @override void onPressed(BuildContext context) async {
+    // Close the message action sheet; we're about to show the share
+    // sheet. (We could do this after the sharing Future settles
+    // with [ShareResultStatus.success], but on iOS I get impatient with
+    // how slowly our action sheet dismisses in that case.)
+    // TODO(#24): Fix iOS bug where this call causes the keyboard to
+    //   reopen (if it was open at the time of this
+    //   `showMessageActionSheet` call) and cover a large part of the
+    //   share sheet.
+    Navigator.of(context).pop();
+    final zulipLocalizations = ZulipLocalizations.of(messageListContext);
+
+    final rawContent = await fetchRawContentWithFeedback(
+      context: messageListContext,
+      messageId: message.id,
+      errorDialogTitle: zulipLocalizations.errorSharingFailed,
+    );
+
+    if (rawContent == null) return;
+
+    if (!messageListContext.mounted) return;
+
+    // TODO: to support iPads, we're asked to give a
+    //   `sharePositionOrigin` param, or risk crashing / hanging:
+    //     https://pub.dev/packages/share_plus#ipad
+    //   Perhaps a wart in the API; discussion:
+    //     https://github.com/zulip/zulip-flutter/pull/12#discussion_r1130146231
+    final result = await Share.share(rawContent);
+
+    switch (result.status) {
+      // The plugin isn't very helpful: "The status can not be determined".
+      // Until we learn otherwise, assume something wrong happened.
+      case ShareResultStatus.unavailable:
+        if (!messageListContext.mounted) return;
+        await showErrorDialog(context: messageListContext,
+          title: zulipLocalizations.errorSharingFailed);
+      case ShareResultStatus.success:
+      case ShareResultStatus.dismissed:
+        // nothing to do
+    }
+  }
 }

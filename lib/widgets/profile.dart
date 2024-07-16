@@ -10,10 +10,15 @@ import 'content.dart';
 import 'message_list.dart';
 import 'page.dart';
 import 'store.dart';
+import 'text.dart';
 
 class _TextStyles {
   static const primaryFieldText = TextStyle(fontSize: 20);
-  static const customProfileFieldLabel = TextStyle(fontSize: 15, fontWeight: FontWeight.bold);
+
+  static TextStyle customProfileFieldLabel(BuildContext context) =>
+    const TextStyle(fontSize: 15)
+      .merge(weightVariableTextStyle(context, wght: 700));
+
   static const customProfileFieldText = TextStyle(fontSize: 15);
 }
 
@@ -22,8 +27,9 @@ class ProfilePage extends StatelessWidget {
 
   final int userId;
 
-  static Route<void> buildRoute({required BuildContext context, required int userId}) {
-    return MaterialAccountWidgetRoute(context: context,
+  static Route<void> buildRoute({int? accountId, BuildContext? context,
+      required int userId}) {
+    return MaterialAccountWidgetRoute(accountId: accountId, context: context,
       page: ProfilePage(userId: userId));
   }
 
@@ -42,7 +48,8 @@ class ProfilePage extends StatelessWidget {
       const SizedBox(height: 16),
       Text(user.fullName,
         textAlign: TextAlign.center,
-        style: _TextStyles.primaryFieldText.merge(const TextStyle(fontWeight: FontWeight.bold))),
+        style: _TextStyles.primaryFieldText
+          .merge(weightVariableTextStyle(context, wght: 700))),
       // TODO(#291) render email field
       Text(roleToLabel(user.role, zulipLocalizations),
         textAlign: TextAlign.center,
@@ -56,7 +63,7 @@ class ProfilePage extends StatelessWidget {
       FilledButton.icon(
         onPressed: () => Navigator.push(context,
           MessageListPage.buildRoute(context: context,
-            narrow: DmNarrow.withUser(userId, selfUserId: store.account.userId))),
+            narrow: DmNarrow.withUser(userId, selfUserId: store.selfUserId))),
         icon: const Icon(Icons.email),
         label: Text(zulipLocalizations.profileButtonSendDirectMessage)),
     ];
@@ -113,7 +120,7 @@ class _ProfileDataTable extends StatelessWidget {
 
   static T? _tryDecode<T, U>(T Function(U) fromJson, String data) {
     try {
-      return fromJson(jsonDecode(data));
+      return fromJson(jsonDecode(data) as U);
     } on FormatException {
       return null;
     } on TypeError {
@@ -188,10 +195,11 @@ class _ProfileDataTable extends StatelessWidget {
 
       items.add(Row(
         crossAxisAlignment: CrossAxisAlignment.baseline,
-        textBaseline: TextBaseline.alphabetic,
+        textBaseline: localizedTextBaseline(context),
         children: [
-          SizedBox(width: 96,
-            child: Text(realmField.name, style: _TextStyles.customProfileFieldLabel)),
+          SizedBox(width: 100,
+            child: Text(style: _TextStyles.customProfileFieldLabel(context),
+              realmField.name)),
           const SizedBox(width: 8),
           Flexible(child: widget),
         ]));
@@ -216,7 +224,9 @@ class _LinkWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final linkNode = LinkNode(url: url, nodes: [TextNode(text)]);
-    final paragraph = Paragraph(node: ParagraphNode(nodes: [linkNode], links: [linkNode]));
+    final paragraph = DefaultTextStyle(
+      style: ContentTheme.of(context).textStylePlainParagraph,
+      child: Paragraph(node: ParagraphNode(nodes: [linkNode], links: [linkNode])));
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: MouseRegion(

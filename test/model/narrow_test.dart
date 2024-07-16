@@ -27,7 +27,7 @@ void main() {
       final stream = eg.stream();
       final message = eg.streamMessage(stream: stream);
       final actual = TopicNarrow.ofMessage(message);
-      check(actual).equals(TopicNarrow(stream.streamId, message.subject));
+      check(actual).equals(TopicNarrow(stream.streamId, message.topic));
     });
   });
 
@@ -36,10 +36,10 @@ void main() {
       check(() => DmNarrow(allRecipientIds: [2, 12], selfUserId: 2)).returnsNormally();
       check(() => DmNarrow(allRecipientIds: [2],     selfUserId: 2)).returnsNormally();
 
-      check(() => DmNarrow(allRecipientIds: [12, 2], selfUserId: 2)).throws();
-      check(() => DmNarrow(allRecipientIds: [2, 2],  selfUserId: 2)).throws();
-      check(() => DmNarrow(allRecipientIds: [2, 12], selfUserId: 1)).throws();
-      check(() => DmNarrow(allRecipientIds: [],      selfUserId: 2)).throws();
+      check(() => DmNarrow(allRecipientIds: [12, 2], selfUserId: 2)).throws<void>();
+      check(() => DmNarrow(allRecipientIds: [2, 2],  selfUserId: 2)).throws<void>();
+      check(() => DmNarrow(allRecipientIds: [2, 12], selfUserId: 1)).throws<void>();
+      check(() => DmNarrow(allRecipientIds: [],      selfUserId: 2)).throws<void>();
     });
 
     test('ofMessage: self-dm', () {
@@ -88,6 +88,20 @@ void main() {
       check(actual).equals(DmNarrow(
           allRecipientIds: [5, 7],
           selfUserId: 5));
+    });
+
+    test('withUsers: without selfUserId', () {
+      final actual = DmNarrow.withUsers([1, 2], selfUserId: 3);
+      check(actual).equals(DmNarrow(
+          allRecipientIds: [1, 2, 3],
+          selfUserId: 3));
+    });
+
+    test('withUsers: with selfUserId', () {
+      final actual = DmNarrow.withUsers([1, 2, 3], selfUserId: 3);
+      check(actual).equals(DmNarrow(
+          allRecipientIds: [1, 2, 3],
+          selfUserId: 3));
     });
 
     test('otherRecipientIds', () {

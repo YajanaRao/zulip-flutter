@@ -1,16 +1,24 @@
 
+import '../api/model/events.dart';
 import '../api/model/initial_snapshot.dart';
 import '../api/model/model.dart';
 import '../api/model/narrow.dart';
 import '../api/route/messages.dart';
+import 'algorithms.dart';
 
 /// A Zulip narrow.
 sealed class Narrow {
   /// This const constructor allows subclasses to have const constructors.
   const Narrow();
 
-  // TODO implement muting; will need containsMessage to take more params
-  //   This means stream muting, topic un/muting, and user muting.
+  /// Whether this message satisfies the filters of this narrow.
+  ///
+  /// This is true just when the server would be expected to include the message
+  /// in a [getMessages] request for this narrow, given appropriate anchor etc.
+  ///
+  /// This does not necessarily mean the message list would show this message
+  /// when navigated to this narrow; in particular it does not address the
+  /// question of whether the stream or topic, or the sending user, is muted.
   bool containsMessage(Message message);
 
   /// This narrow, expressed as an [ApiNarrow].
@@ -31,13 +39,12 @@ sealed class SendableNarrow extends Narrow {
   MessageDestination get destination;
 }
 
-/// The narrow called "All messages" in the UI.
+/// The narrow called "Combined feed" in the UI.
 ///
-/// This does not literally mean all messages, or even all messages
-/// that the user has access to: in particular it excludes muted streams
-/// and topics.
-class AllMessagesNarrow extends Narrow {
-  const AllMessagesNarrow();
+/// All messages the user has access to, excluding unsubscribed streams
+/// and muted streams and topics. See [PerAccountStore.isTopicVisible].
+class CombinedFeedNarrow extends Narrow {
+  const CombinedFeedNarrow();
 
   @override
   bool containsMessage(Message message) {
@@ -49,13 +56,13 @@ class AllMessagesNarrow extends Narrow {
 
   @override
   bool operator ==(Object other) {
-    if (other is! AllMessagesNarrow) return false;
+    if (other is! CombinedFeedNarrow) return false;
     // Conceptually there's only one value of this type.
     return true;
   }
 
   @override
-  int get hashCode => 'AllMessagesNarrow'.hashCode;
+  int get hashCode => 'CombinedFeedNarrow'.hashCode;
 }
 
 class StreamNarrow extends Narrow {
@@ -88,7 +95,7 @@ class TopicNarrow extends Narrow implements SendableNarrow {
   const TopicNarrow(this.streamId, this.topic);
 
   factory TopicNarrow.ofMessage(StreamMessage message) {
-    return TopicNarrow(message.streamId, message.subject);
+    return TopicNarrow(message.streamId, message.topic);
   }
 
   final int streamId;
@@ -97,7 +104,7 @@ class TopicNarrow extends Narrow implements SendableNarrow {
   @override
   bool containsMessage(Message message) {
     return (message is StreamMessage
-      && message.streamId == streamId && message.subject == topic);
+      && message.streamId == streamId && message.topic == topic);
   }
 
   @override
@@ -119,32 +126,59 @@ class TopicNarrow extends Narrow implements SendableNarrow {
   int get hashCode => Object.hash('TopicNarrow', streamId, topic);
 }
 
-bool _isSortedWithoutDuplicates(List<int> items) {
-  final length = items.length;
-  if (length == 0) {
-    return true;
-  }
-  int lastItem = items[0];
-  for (int i = 1; i < length; i++) {
-    final item = items[i];
-    if (item <= lastItem) {
-      return false;
-    }
-    lastItem = item;
-  }
-  return true;
-}
-
 /// The narrow for a direct-message conversation.
 // Zulip has many ways of representing a DM conversation; for example code
 // handling many of them, see zulip-mobile:src/utils/recipient.js .
 // Please add more constructors and getters here to handle any of those
 // as we turn out to need them.
 class DmNarrow extends Narrow implements SendableNarrow {
+  /// Construct a [DmNarrow] directly from its representation.
+  ///
+  /// The user IDs in `allRecipientIds` must be distinct and sorted,
+  /// and must include `selfUserId`.
+  ///
+  /// For consuming data that follows a different convention,
+  /// see other constructors.
   DmNarrow({required this.allRecipientIds, required int selfUserId})
-    : assert(_isSortedWithoutDuplicates(allRecipientIds)),
+    : assert(isSortedWithoutDuplicates(allRecipientIds)),
       assert(allRecipientIds.contains(selfUserId)),
       _selfUserId = selfUserId;
+
+  /// A [DmNarrow] for self plus the given zero-or-more other users.
+  ///
+  /// The user IDs in `otherRecipientIds` must all be distinct from
+  /// each other and from `selfUserId`.  They need not be sorted.
+  ///
+  /// See also:
+  ///  * the plain [DmNarrow] constructor, given a list that includes self.
+  ///  * [DmNarrow.withUsers], given a list that may or may not include self.
+  factory DmNarrow.withOtherUsers(Iterable<int> otherRecipientIds,
+      {required int selfUserId}) {
+    return DmNarrow(selfUserId: selfUserId,
+      allRecipientIds: [...otherRecipientIds, selfUserId]..sort());
+  }
+
+  /// A [DmNarrow] for a 1:1 DM conversation, either with self or otherwise.
+  factory DmNarrow.withUser(int userId, {required int selfUserId}) {
+    return DmNarrow(selfUserId: selfUserId,
+      allRecipientIds: (userId == selfUserId)  ? [selfUserId]
+                       : (userId < selfUserId) ? [userId, selfUserId]
+                       :                         [selfUserId, userId]);
+  }
+
+  /// A [DmNarrow] from a list of users which may or may not include self
+  /// and may or may not be sorted.
+  ///
+  /// Use this only when the input format is actually permitted both to
+  /// include and to exclude the self user.  When the list is known to be
+  /// one or the other, using the plain [DmNarrow] constructor
+  /// or [DmNarrow.withOtherUsers] respectively will be more efficient.
+  factory DmNarrow.withUsers(List<int> userIds, {required int selfUserId}) {
+    return DmNarrow(
+      allRecipientIds: {...userIds, selfUserId}.toList()..sort(),
+      selfUserId: selfUserId,
+    );
+  }
 
   factory DmNarrow.ofMessage(DmMessage message, {required int selfUserId}) {
     return DmNarrow(
@@ -155,17 +189,23 @@ class DmNarrow extends Narrow implements SendableNarrow {
 
   /// A [DmNarrow] from an item in [InitialSnapshot.recentPrivateConversations].
   factory DmNarrow.ofRecentDmConversation(RecentDmConversation conversation, {required int selfUserId}) {
-    return DmNarrow(
-      allRecipientIds: [...conversation.userIds, selfUserId]..sort(),
-      selfUserId: selfUserId,
-    );
+    return DmNarrow.withOtherUsers(conversation.userIds, selfUserId: selfUserId);
   }
 
-  factory DmNarrow.withUser(int userId, {required int selfUserId}) {
-    return DmNarrow(
-      allRecipientIds: {userId, selfUserId}.toList()..sort(),
-      selfUserId: selfUserId,
-    );
+  /// A [DmNarrow] from an [UnreadHuddleSnapshot].
+  factory DmNarrow.ofUnreadHuddleSnapshot(UnreadHuddleSnapshot snapshot, {required int selfUserId}) {
+    final userIds = snapshot.userIdsString.split(',').map((id) => int.parse(id));
+    return DmNarrow(selfUserId: selfUserId,
+      // (already sorted; see API doc)
+      allRecipientIds: userIds.toList(growable: false));
+  }
+
+  factory DmNarrow.ofUpdateMessageFlagsMessageDetail(
+    UpdateMessageFlagsMessageDetail detail, {
+    required int selfUserId,
+  }) {
+    assert(detail.type == MessageType.direct);
+    return DmNarrow.withOtherUsers(detail.userIds!, selfUserId: selfUserId);
   }
 
   /// The user IDs of everyone in the conversation, sorted.

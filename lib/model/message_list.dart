@@ -25,6 +25,12 @@ class MessageListRecipientHeaderItem extends MessageListItem {
   MessageListRecipientHeaderItem(this.message);
 }
 
+class MessageListDateSeparatorItem extends MessageListItem {
+  final Message message;
+
+  MessageListDateSeparatorItem(this.message);
+}
+
 /// A message to show in the message list.
 class MessageListMessageItem extends MessageListItem {
   final Message message;
@@ -106,7 +112,7 @@ mixin _MessageSequence {
       (message, messageId) => message.id.compareTo(messageId));
   }
 
-  int _findItemWithMessageId(int messageId) {
+  int findItemWithMessageId(int messageId) {
     return binarySearchByKey(items, messageId, _compareItemToMessageId);
   }
 
@@ -118,6 +124,7 @@ mixin _MessageSequence {
           case MessageListDirection.older:       return -1;
         }
       case MessageListRecipientHeaderItem(:var message):
+      case MessageListDateSeparatorItem(:var message):
         return (message.id <= messageId) ? -1 : 1;
       case MessageListMessageItem(:var message): return message.id.compareTo(messageId);
     }
@@ -129,7 +136,7 @@ mixin _MessageSequence {
     final content = parseContent(message.content);
     contents[index] = content;
 
-    final itemIndex = _findItemWithMessageId(message.id);
+    final itemIndex = findItemWithMessageId(message.id);
     assert(itemIndex > -1
       && items[itemIndex] is MessageListMessageItem
       && identical((items[itemIndex] as MessageListMessageItem).message, message));
@@ -146,6 +153,30 @@ mixin _MessageSequence {
     contents.add(parseContent(message.content));
     assert(contents.length == messages.length);
     _processMessage(messages.length - 1);
+  }
+
+  /// Removes the given messages, if present.
+  ///
+  /// Returns true if at least one message was present, false otherwise.
+  /// If none of [messageIds] are found, this is a no-op.
+  bool _removeMessagesById(Iterable<int> messageIds) {
+    final messagesToRemoveById = <int>{};
+    final contentToRemove = Set<ZulipContent>.identity();
+    for (final messageId in messageIds) {
+      final index = _findMessageWithId(messageId);
+      if (index == -1) continue;
+      messagesToRemoveById.add(messageId);
+      contentToRemove.add(contents[index]);
+    }
+    if (messagesToRemoveById.isEmpty) return false;
+
+    assert(contents.length == messages.length);
+    messages.removeWhere((message) => messagesToRemoveById.contains(message.id));
+    contents.removeWhere((content) => contentToRemove.contains(content));
+    assert(contents.length == messages.length);
+    _reprocessAll();
+
+    return true;
   }
 
   void _insertAllMessages(int index, Iterable<Message> toInsert) {
@@ -181,16 +212,22 @@ mixin _MessageSequence {
     final message = messages[index];
     final content = contents[index];
     bool canShareSender;
-    if (index > 0 && canShareRecipientHeader(messages[index - 1], message)) {
+    if (index == 0 || !haveSameRecipient(messages[index - 1], message)) {
+      items.add(MessageListRecipientHeaderItem(message));
+      canShareSender = false;
+    } else {
       assert(items.last is MessageListMessageItem);
       final prevMessageItem = items.last as MessageListMessageItem;
       assert(identical(prevMessageItem.message, messages[index - 1]));
       assert(prevMessageItem.isLastInBlock);
       prevMessageItem.isLastInBlock = false;
-      canShareSender = (prevMessageItem.message.senderId == message.senderId);
-    } else {
-      items.add(MessageListRecipientHeaderItem(message));
-      canShareSender = false;
+
+      if (!messagesSameDay(prevMessageItem.message, message)) {
+        items.add(MessageListDateSeparatorItem(message));
+        canShareSender = false;
+      } else {
+        canShareSender = (prevMessageItem.message.senderId == message.senderId);
+      }
     }
     items.add(MessageListMessageItem(message, content,
       showSender: !canShareSender, isLastInBlock: true));
@@ -228,10 +265,10 @@ mixin _MessageSequence {
 }
 
 @visibleForTesting
-bool canShareRecipientHeader(Message prevMessage, Message message) {
+bool haveSameRecipient(Message prevMessage, Message message) {
   if (prevMessage is StreamMessage && message is StreamMessage) {
     if (prevMessage.streamId != message.streamId) return false;
-    if (prevMessage.subject != message.subject) return false;
+    if (prevMessage.topic != message.topic) return false;
   } else if (prevMessage is DmMessage && message is DmMessage) {
     if (!_equalIdSequences(prevMessage.allRecipientIds, message.allRecipientIds)) {
       return false;
@@ -239,6 +276,7 @@ bool canShareRecipientHeader(Message prevMessage, Message message) {
   } else {
     return false;
   }
+  return true;
 
   // switch ((prevMessage, message)) {
   //   case (StreamMessage(), StreamMessage()):
@@ -248,12 +286,14 @@ bool canShareRecipientHeader(Message prevMessage, Message message) {
   //   default:
   //     return false;
   // }
+}
 
+@visibleForTesting
+bool messagesSameDay(Message prevMessage, Message message) {
   // TODO memoize [DateTime]s... also use memoized for showing date/time in msglist
   final prevTime = DateTime.fromMillisecondsSinceEpoch(prevMessage.timestamp * 1000);
   final time = DateTime.fromMillisecondsSinceEpoch(message.timestamp * 1000);
   if (!_sameDay(prevTime, time)) return false;
-
   return true;
 }
 
@@ -307,6 +347,48 @@ class MessageListView with ChangeNotifier, _MessageSequence {
   final PerAccountStore store;
   final Narrow narrow;
 
+  /// Whether [message] should actually appear in this message list,
+  /// given that it does belong to the narrow.
+  ///
+  /// This depends in particular on whether the message is muted in
+  /// one way or another.
+  ///
+  /// See also [_allMessagesVisible].
+  bool _messageVisible(Message message) {
+    switch (narrow) {
+      case CombinedFeedNarrow():
+        return switch (message) {
+          StreamMessage() =>
+            store.isTopicVisible(message.streamId, message.topic),
+          DmMessage() => true,
+        };
+
+      case StreamNarrow(:final streamId):
+        assert(message is StreamMessage && message.streamId == streamId);
+        if (message is! StreamMessage) return false;
+        return store.isTopicVisibleInStream(streamId, message.topic);
+
+      case TopicNarrow():
+      case DmNarrow():
+        return true;
+    }
+  }
+
+  /// Whether [_messageVisible] is true for all possible messages.
+  ///
+  /// This is useful for an optimization.
+  bool get _allMessagesVisible {
+    switch (narrow) {
+      case CombinedFeedNarrow():
+      case StreamNarrow():
+        return false;
+
+      case TopicNarrow():
+      case DmNarrow():
+        return true;
+    }
+  }
+
   /// Fetch messages, starting from scratch.
   Future<void> fetchInitial() async {
     // TODO(#80): fetch from anchor firstUnread, instead of newest
@@ -320,8 +402,11 @@ class MessageListView with ChangeNotifier, _MessageSequence {
       numBefore: kMessageListFetchBatchSize,
       numAfter: 0,
     );
+    store.reconcileMessages(result.messages);
     for (final message in result.messages) {
-      _addMessage(message);
+      if (_messageVisible(message)) {
+        _addMessage(message);
+      }
     }
     _fetched = true;
     _haveOldest = result.foundOldest;
@@ -353,7 +438,13 @@ class MessageListView with ChangeNotifier, _MessageSequence {
         result.messages.removeLast();
       }
 
-      _insertAllMessages(0, result.messages);
+      store.reconcileMessages(result.messages);
+
+      final fetchedMessages = _allMessagesVisible
+        ? result.messages // Avoid unnecessarily copying the list.
+        : result.messages.where(_messageVisible);
+
+      _insertAllMessages(0, fetchedMessages);
       _haveOldest = result.foundOldest;
     } finally {
       _fetchingOlder = false;
@@ -362,11 +453,16 @@ class MessageListView with ChangeNotifier, _MessageSequence {
     }
   }
 
-  /// Add [message] to this view, if it belongs here.
-  ///
-  /// Called in particular when we get a [MessageEvent].
-  void maybeAddMessage(Message message) {
-    if (!narrow.containsMessage(message)) {
+  void handleDeleteMessageEvent(DeleteMessageEvent event) {
+    if (_removeMessagesById(event.messageIds)) {
+      notifyListeners();
+    }
+  }
+
+  /// Add [MessageEvent.message] to this view, if it belongs here.
+  void handleMessageEvent(MessageEvent event) {
+    final message = event.message;
+    if (!narrow.containsMessage(message) || !_messageVisible(message)) {
       return;
     }
     if (!_fetched) {
@@ -378,104 +474,38 @@ class MessageListView with ChangeNotifier, _MessageSequence {
     notifyListeners();
   }
 
-  static void _applyChangesToMessage(UpdateMessageEvent event, Message message) {
-    // TODO(server-5): Cut this fallback; rely on renderingOnly from FL 114
-    final isRenderingOnly = event.renderingOnly ?? (event.userId == null);
-    if (event.editTimestamp != null && !isRenderingOnly) {
-      // A rendering-only update gets omitted from the message edit history,
-      // and [Message.lastEditTimestamp] is the last timestamp of that history.
-      // So on a rendering-only update, the timestamp doesn't get updated.
-      message.lastEditTimestamp = event.editTimestamp;
-    }
-
-    message.flags = event.flags;
-
-    if (event.renderedContent != null) {
-      assert(message.contentType == 'text/html',
-        "Message contentType was ${message.contentType}; expected text/html.");
-      message.content = event.renderedContent!;
-    }
-
-    if (event.isMeMessage != null) {
-      message.isMeMessage = event.isMeMessage!;
-    }
-  }
-
-  /// Update the message the given event applies to, if present in this view.
+  /// Update data derived from the content of the given message.
   ///
-  /// This method only handles the case where the message's contents
-  /// were changed, and ignores any changes to its stream or topic.
-  ///
-  /// TODO(#150): Handle message moves.
-  // NB that when handling message moves (#150), recipient headers
-  // may need updating, and consequently showSender too.
-  void maybeUpdateMessage(UpdateMessageEvent event) {
-    final idx = _findMessageWithId(event.messageId);
-    if (idx == -1)  {
-      return;
+  /// This does not notify listeners.
+  /// The caller should ensure that happens later.
+  void messageContentChanged(int messageId) {
+    final index = _findMessageWithId(messageId);
+    if (index != -1) {
+      _reparseContent(index);
     }
-
-    _applyChangesToMessage(event, messages[idx]);
-    _reparseContent(idx);
-    notifyListeners();
   }
 
-  void maybeUpdateMessageFlags(UpdateMessageFlagsEvent event) {
-    final isAdd = switch (event) {
-      UpdateMessageFlagsAddEvent()    => true,
-      UpdateMessageFlagsRemoveEvent() => false,
-    };
-
-    bool didUpdateAny = false;
-    if (isAdd && (event as UpdateMessageFlagsAddEvent).all) {
-      for (final message in messages) {
-        message.flags.add(event.flag);
-        didUpdateAny = true;
-      }
-    } else {
-      for (final messageId in event.messages) {
-        final index = _findMessageWithId(messageId);
-        if (index != -1) {
-          final message = messages[index];
-          isAdd ? message.flags.add(event.flag) : message.flags.remove(event.flag);
-          didUpdateAny = true;
-        }
-      }
-    }
-    if (!didUpdateAny) {
-      return;
-    }
-
-    notifyListeners();
+  // Repeal the `@protected` annotation that applies on the base implementation,
+  // so we can call this method from [MessageStoreImpl].
+  @override
+  void notifyListeners() {
+    super.notifyListeners();
   }
 
-  void maybeUpdateMessageReactions(ReactionEvent event) {
-    final index = _findMessageWithId(event.messageId);
-    if (index == -1) {
-      return;
+  /// Notify listeners if the given message is present in this view.
+  void notifyListenersIfMessagePresent(int messageId) {
+    final index = _findMessageWithId(messageId);
+    if (index != -1) {
+      notifyListeners();
     }
+  }
 
-    final message = messages[index];
-    switch (event.op) {
-      case ReactionOp.add:
-        (message.reactions ??= Reactions([])).add(Reaction(
-          emojiName: event.emojiName,
-          emojiCode: event.emojiCode,
-          reactionType: event.reactionType,
-          userId: event.userId,
-        ));
-      case ReactionOp.remove:
-        if (message.reactions == null) { // TODO(log)
-          return;
-        }
-        message.reactions!.remove(
-          reactionType: event.reactionType,
-          emojiCode: event.emojiCode,
-          userId: event.userId,
-        );
+  /// Notify listeners if any of the given messages is present in this view.
+  void notifyListenersIfAnyMessagePresent(Iterable<int> messageIds) {
+    final isAnyPresent = messageIds.any((id) => _findMessageWithId(id) != -1);
+    if (isAnyPresent) {
+      notifyListeners();
     }
-
-    notifyListeners();
   }
 
   /// Called when the app is reassembled during debugging, e.g. for hot reload.

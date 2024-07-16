@@ -13,9 +13,50 @@ import '../api/fake_api.dart';
 ///
 /// The per-account stores will use [FakeApiConnection].
 ///
+/// Unlike with [LiveGlobalStore] and the associated [UpdateMachine.load],
+/// there is no automatic event-polling loop or other automated requests.
+/// For each account loaded, there is a corresponding [UpdateMachine]
+/// in [updateMachines], which tests can use for invoking that logic
+/// explicitly when desired.
+///
 /// See also [TestZulipBinding.globalStore], which provides one of these.
 class TestGlobalStore extends GlobalStore {
   TestGlobalStore({required super.accounts});
+
+  final Map<
+    ({Uri realmUrl, int? zulipFeatureLevel, String? email, String? apiKey}),
+    FakeApiConnection
+  > _apiConnections = {};
+
+  /// Get or construct a [FakeApiConnection] with the given arguments.
+  ///
+  /// This breaches the base method's contract slightly, in that on repeated
+  /// calls with the same arguments it returns the same connection, rather than
+  /// a fresh one each time.  That breach is very convenient for tests,
+  /// enabling a test to get access to the same [FakeApiConnection] that the
+  /// code under test will get, so as to use [FakeApiConnection.prepare]
+  /// and [FakeApiConnection.lastRequest].
+  ///
+  /// However, if the connection returned by a previous call has been closed
+  /// with [ApiConnection.close], then that connection will be ignored in favor
+  /// of returning (and saving for next time) a fresh connection after all.
+  @override
+  FakeApiConnection apiConnection({
+      required Uri realmUrl, required int? zulipFeatureLevel,
+      String? email, String? apiKey}) {
+    final key = (realmUrl: realmUrl, zulipFeatureLevel: zulipFeatureLevel,
+      email: email, apiKey: apiKey);
+    final connection = _apiConnections[key];
+    if (connection != null && connection.isOpen) {
+      return connection;
+    }
+    return (_apiConnections[key] = FakeApiConnection(
+      realmUrl: realmUrl, zulipFeatureLevel: zulipFeatureLevel,
+      email: email, apiKey: apiKey));
+  }
+
+  /// A corresponding [UpdateMachine] for each loaded account.
+  final Map<int, UpdateMachine> updateMachines = {};
 
   final Map<int, InitialSnapshot> _initialSnapshots = {};
 
@@ -35,6 +76,16 @@ class TestGlobalStore extends GlobalStore {
 
   @override
   Future<Account> doInsertAccount(AccountsCompanion data) async {
+    // Check for duplication is typically handled by the database but since
+    // we're not using a real database, this needs to be handled here.
+    // See [AppDatabase.createAccount].
+    if (accounts.any((account) =>
+          data.realmUrl.value == account.realmUrl
+          && (data.userId.value == account.userId
+              || data.email.value == account.email))) {
+      throw AccountAlreadyExistsException();
+    }
+
     final accountId = data.id.present ? data.id.value : _nextAccountId++;
     return Account(
       id: accountId,
@@ -49,31 +100,68 @@ class TestGlobalStore extends GlobalStore {
   }
 
   @override
-  Future<PerAccountStore> loadPerAccount(Account account) {
-    return Future.value(PerAccountStore.fromInitialSnapshot(
-      account: account,
-      connection: FakeApiConnection.fromAccount(account),
-      initialSnapshot: _initialSnapshots[account.id]!,
-    ));
+  Future<void> doUpdateAccount(int accountId, AccountsCompanion data) async {
+    // Nothing to do.
+  }
+
+  @override
+  Future<PerAccountStore> loadPerAccount(int accountId) {
+    final initialSnapshot = _initialSnapshots[accountId]!;
+    final store = PerAccountStore.fromInitialSnapshot(
+      globalStore: this,
+      accountId: accountId,
+      initialSnapshot: initialSnapshot,
+    );
+    updateMachines[accountId] = UpdateMachine.fromInitialSnapshot(
+      store: store, initialSnapshot: initialSnapshot);
+    return Future.value(store);
   }
 }
 
 extension PerAccountStoreTestExtension on PerAccountStore {
-  void addUser(User user) {
-    handleEvent(RealmUserAddEvent(id: 1, person: user));
+  Future<void> addUser(User user) async {
+    await handleEvent(RealmUserAddEvent(id: 1, person: user));
   }
 
-  void addUsers(Iterable<User> users) {
+  Future<void> addUsers(Iterable<User> users) async {
     for (final user in users) {
-      addUser(user);
+      await addUser(user);
     }
   }
 
-  void addStream(ZulipStream stream) {
-    addStreams([stream]);
+  Future<void> addStream(ZulipStream stream) async {
+    await addStreams([stream]);
   }
 
-  void addStreams(List<ZulipStream> streams) {
-    handleEvent(StreamCreateEvent(id: 1, streams: streams));
+  Future<void> addStreams(List<ZulipStream> streams) async {
+    await handleEvent(StreamCreateEvent(id: 1, streams: streams));
+  }
+
+  Future<void> addSubscription(Subscription subscription) async {
+    await addSubscriptions([subscription]);
+  }
+
+  Future<void> addSubscriptions(List<Subscription> subscriptions) async {
+    await handleEvent(SubscriptionAddEvent(id: 1, subscriptions: subscriptions));
+  }
+
+  Future<void> addUserTopic(ZulipStream stream, String topic, UserTopicVisibilityPolicy visibilityPolicy) async {
+    await handleEvent(UserTopicEvent(
+      id: 1,
+      streamId: stream.streamId,
+      topicName: topic,
+      lastUpdated: 1234567890,
+      visibilityPolicy: visibilityPolicy,
+    ));
+  }
+
+  Future<void> addMessage(Message message) async {
+    await handleEvent(MessageEvent(id: 1, message: message));
+  }
+
+  Future<void> addMessages(Iterable<Message> messages) async {
+    for (final message in messages) {
+      await addMessage(message);
+    }
   }
 }

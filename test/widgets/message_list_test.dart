@@ -1,25 +1,39 @@
-import 'dart:io';
+import 'dart:convert';
 
 import 'package:checks/checks.dart';
+import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:zulip/api/model/events.dart';
+import 'package:zulip/api/model/initial_snapshot.dart';
 import 'package:zulip/api/model/model.dart';
+import 'package:zulip/api/model/narrow.dart';
+import 'package:zulip/api/route/messages.dart';
+import 'package:zulip/model/localizations.dart';
 import 'package:zulip/model/narrow.dart';
 import 'package:zulip/model/store.dart';
 import 'package:zulip/widgets/content.dart';
+import 'package:zulip/widgets/icons.dart';
 import 'package:zulip/widgets/message_list.dart';
-import 'package:zulip/widgets/sticky_header.dart';
 import 'package:zulip/widgets/store.dart';
+import 'package:zulip/widgets/stream_colors.dart';
+import 'package:zulip/widgets/theme.dart';
 
 import '../api/fake_api.dart';
 import '../example_data.dart' as eg;
 import '../model/binding.dart';
+import '../model/content_test.dart';
 import '../model/message_list_test.dart';
 import '../model/test_store.dart';
+import '../flutter_checks.dart';
+import '../model/unreads_checks.dart';
 import '../stdlib_checks.dart';
 import '../test_images.dart';
 import 'content_checks.dart';
+import 'dialog_checks.dart';
 
 void main() {
   TestZulipBinding.ensureInitialized();
@@ -28,49 +42,75 @@ void main() {
   late FakeApiConnection connection;
 
   Future<void> setupMessageListPage(WidgetTester tester, {
-    Narrow narrow = const AllMessagesNarrow(),
+    Narrow narrow = const CombinedFeedNarrow(),
     bool foundOldest = true,
     int? messageCount,
     List<Message>? messages,
+    List<ZulipStream>? streams,
+    List<User>? users,
+    List<Subscription>? subscriptions,
+    UnreadMessagesSnapshot? unreadMsgs,
   }) async {
     addTearDown(testBinding.reset);
-    await testBinding.globalStore.add(eg.selfAccount, eg.initialSnapshot());
+    streams ??= subscriptions ??= [eg.subscription(eg.stream(streamId: eg.defaultStreamMessageStreamId))];
+    await testBinding.globalStore.add(eg.selfAccount, eg.initialSnapshot(
+      streams: streams, subscriptions: subscriptions, unreadMsgs: unreadMsgs));
     store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
     connection = store.connection as FakeApiConnection;
 
     // prepare message list data
-    store.addUser(eg.selfUser);
+    await store.addUser(eg.selfUser);
+    await store.addUsers(users ?? []);
     assert((messageCount == null) != (messages == null));
     messages ??= List.generate(messageCount!, (index) {
-      return eg.streamMessage(id: index, sender: eg.selfUser);
+      return eg.streamMessage(sender: eg.selfUser);
     });
     connection.prepare(json:
       newestResult(foundOldest: foundOldest, messages: messages).toJson());
 
-    await tester.pumpWidget(
+    await tester.pumpWidget(Builder(builder: (context) =>
       MaterialApp(
+        theme: zulipThemeData(context),
+        localizationsDelegates: ZulipLocalizations.localizationsDelegates,
+        supportedLocales: ZulipLocalizations.supportedLocales,
         home: GlobalStoreWidget(
           child: PerAccountStoreWidget(
             accountId: eg.selfAccount.id,
-            child: MessageListPage(narrow: narrow)))));
+            child: MessageListPage(narrow: narrow))))));
 
     // global store, per-account store, and message list get loaded
     await tester.pumpAndSettle();
   }
 
   ScrollController? findMessageListScrollController(WidgetTester tester) {
-    final stickyHeaderListView = tester.widget<StickyHeaderListView>(find.byType(StickyHeaderListView));
-    return stickyHeaderListView.controller;
+    final scrollView = tester.widget<CustomScrollView>(find.byType(CustomScrollView));
+    return scrollView.controller;
   }
+
+  group('presents message content appropriately', () {
+    // regression test for https://github.com/zulip/zulip-flutter/issues/736
+    testWidgets('content in "Combined feed" not asked to consume insets (including bottom)', (tester) async {
+      const fakePadding = FakeViewPadding(left: 10, top: 10, right: 10, bottom: 10);
+      tester.view.viewInsets = fakePadding;
+      tester.view.padding = fakePadding;
+
+      await setupMessageListPage(tester, narrow: const CombinedFeedNarrow(),
+        messages: [eg.streamMessage(content: ContentExample.codeBlockPlain.html)]);
+
+      final element = tester.element(find.byType(CodeBlock));
+      final padding = MediaQuery.of(element).padding;
+      check(padding).equals(EdgeInsets.zero);
+    });
+  });
 
   group('fetch older messages on scroll', () {
     int? itemCount(WidgetTester tester) =>
-      tester.widget<StickyHeaderListView>(find.byType(StickyHeaderListView)).semanticChildCount;
+      tester.widget<CustomScrollView>(find.byType(CustomScrollView)).semanticChildCount;
 
     testWidgets('basic', (tester) async {
       await setupMessageListPage(tester, foundOldest: false,
-        messages: List.generate(200, (i) => eg.streamMessage(id: 950 + i, sender: eg.selfUser)));
-      check(itemCount(tester)).equals(201);
+        messages: List.generate(300, (i) => eg.streamMessage(id: 950 + i, sender: eg.selfUser)));
+      check(itemCount(tester)).equals(303);
 
       // Fling-scroll upward...
       await tester.fling(find.byType(MessageListPage), const Offset(0, 300), 8000);
@@ -83,7 +123,7 @@ void main() {
       await tester.pump(Duration.zero); // Allow a frame for the response to arrive.
 
       // Now we have more messages.
-      check(itemCount(tester)).equals(301);
+      check(itemCount(tester)).equals(403);
     });
 
     testWidgets('observe double-fetch glitch', (tester) async {
@@ -115,6 +155,37 @@ void main() {
       check(itemCount(tester)).equals(301);
     }, skip: true); // TODO this still reproduces manually, still needs debugging,
                     // but has become harder to reproduce in a test.
+
+    testWidgets("avoid getting distracted by nested viewports' metrics", (tester) async {
+      // Regression test for: https://github.com/zulip/zulip-flutter/issues/507
+      await setupMessageListPage(tester, foundOldest: false, messages: [
+        ...List.generate(300, (i) => eg.streamMessage(id: 1000 + i)),
+        eg.streamMessage(id: 1301, content: ContentExample.codeBlockPlain.html),
+        ...List.generate(100, (i) => eg.streamMessage(id: 1302 + i)),
+      ]);
+      final lastRequest = connection.lastRequest;
+      check(itemCount(tester)).equals(404);
+
+      // Fling-scroll upward...
+      await tester.fling(find.byType(MessageListPage), const Offset(0, 300), 8000);
+      await tester.pump();
+
+      // ... in particular past the message with a [CodeBlockNode]...
+      bool sawCodeBlock = false;
+      for (int i = 0; i < 30; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+        if (tester.widgetList(find.byType(CodeBlock)).isNotEmpty) {
+          sawCodeBlock = true;
+          break;
+        }
+      }
+      check(sawCodeBlock).isTrue();
+
+      // ... and we should attempt no fetches.  (This check isn't strictly
+      // necessary; a request would have thrown, as we prepared no response.)
+      await tester.pump();
+      check(connection.lastRequest).identicalTo(lastRequest);
+    });
   });
 
   group('ScrollToBottomButton interactions', () {
@@ -132,7 +203,7 @@ void main() {
       // Initial state should be not visible, as the message list renders with latest message in view
       check(isButtonVisible(tester)).equals(false);
 
-      scrollController.jumpTo(600);
+      scrollController.jumpTo(-600);
       await tester.pump();
       check(isButtonVisible(tester)).equals(true);
 
@@ -149,7 +220,7 @@ void main() {
       // Initial state should be not visible, as the message list renders with latest message in view
       check(isButtonVisible(tester)).equals(false);
 
-      scrollController.jumpTo(600);
+      scrollController.jumpTo(-600);
       await tester.pump();
       check(isButtonVisible(tester)).equals(true);
 
@@ -171,7 +242,7 @@ void main() {
       // Initial state should be not visible, as the message list renders with latest message in view
       check(isButtonVisible(tester)).equals(false);
 
-      scrollController.jumpTo(600);
+      scrollController.jumpTo(-600);
       await tester.pump();
       check(isButtonVisible(tester)).equals(true);
 
@@ -183,62 +254,191 @@ void main() {
   });
 
   group('recipient headers', () {
-    testWidgets('show stream name from message when stream unknown', (tester) async {
-      // This can perfectly well happen, because message fetches can race
-      // with events.
+    group('StreamMessageRecipientHeader', () {
       final stream = eg.stream(name: 'stream name');
-      await setupMessageListPage(tester, messages: [
-        eg.streamMessage(stream: stream),
-      ]);
-      await tester.pump();
-      tester.widget(find.text('stream name'));
-    });
+      final message = eg.streamMessage(stream: stream, topic: 'topic name');
 
-    testWidgets('show stream name from stream data when known', (tester) async {
-      final stream = eg.stream(name: 'old stream name');
-      await setupMessageListPage(tester, messages: [
-        eg.streamMessage(stream: stream),
-      ]);
-      // TODO(#182) this test would be more realistic using a StreamUpdateEvent
-      store.handleEvent(StreamCreateEvent(id: stream.streamId, streams: [
-        ZulipStream.fromJson({
-          ...(deepToJson(stream) as Map<String, dynamic>),
+      FinderResult<Element> findInMessageList(String text) {
+        // Stream name shows up in [AppBar] so need to avoid matching that
+        return find.descendant(
+          of: find.byType(MessageList),
+          matching: find.text(text)).evaluate();
+      }
+
+      testWidgets('show stream name in CombinedFeedNarrow', (tester) async {
+        await setupMessageListPage(tester,
+          narrow: const CombinedFeedNarrow(),
+          messages: [message], subscriptions: [eg.subscription(stream)]);
+        await tester.pump();
+        check(findInMessageList('stream name')).length.equals(1);
+        check(findInMessageList('topic name')).length.equals(1);
+      });
+
+      testWidgets('do not show stream name in StreamNarrow', (tester) async {
+        await setupMessageListPage(tester,
+          narrow: StreamNarrow(stream.streamId),
+          messages: [message], streams: [stream]);
+        await tester.pump();
+        check(findInMessageList('stream name')).length.equals(0);
+        check(findInMessageList('topic name')).length.equals(1);
+      });
+
+      testWidgets('do not show stream name in TopicNarrow', (tester) async {
+        await setupMessageListPage(tester,
+          narrow: TopicNarrow.ofMessage(message),
+          messages: [message], streams: [stream]);
+        await tester.pump();
+        check(findInMessageList('stream name')).length.equals(0);
+        check(findInMessageList('topic name')).length.equals(1);
+      });
+
+      testWidgets('color of recipient header background', (tester) async {
+        final subscription = eg.subscription(stream, color: Colors.red.value);
+        final swatch = StreamColorSwatch.light(subscription.color);
+        await setupMessageListPage(tester,
+          messages: [eg.streamMessage(stream: subscription)],
+          subscriptions: [subscription]);
+        await tester.pump();
+        check(tester.widget<ColoredBox>(
+          find.descendant(
+            of: find.byType(StreamMessageRecipientHeader),
+            matching: find.byType(ColoredBox),
+        ))).color.equals(swatch.barBackground);
+      });
+
+      testWidgets('color of stream icon', (tester) async {
+        final stream = eg.stream(isWebPublic: true);
+        final subscription = eg.subscription(stream, color: Colors.red.value);
+        final swatch = StreamColorSwatch.light(subscription.color);
+        await setupMessageListPage(tester,
+          messages: [eg.streamMessage(stream: subscription)],
+          subscriptions: [subscription]);
+        await tester.pump();
+        check(tester.widget<Icon>(find.byIcon(ZulipIcons.globe)))
+          .color.equals(swatch.iconOnBarBackground);
+      });
+
+      testWidgets('normal streams show hash icon', (tester) async {
+        final stream = eg.stream(isWebPublic: false, inviteOnly: false);
+        await setupMessageListPage(tester,
+          messages: [eg.streamMessage(stream: stream)],
+          subscriptions: [eg.subscription(stream)]);
+        await tester.pump();
+        check(find.descendant(
+          of: find.byType(StreamMessageRecipientHeader),
+          matching: find.byIcon(ZulipIcons.hash_sign),
+        ).evaluate()).length.equals(1);
+      });
+
+      testWidgets('public streams show globe icon', (tester) async {
+        final stream = eg.stream(isWebPublic: true);
+        await setupMessageListPage(tester,
+          messages: [eg.streamMessage(stream: stream)],
+          subscriptions: [eg.subscription(stream)]);
+        await tester.pump();
+        check(find.descendant(
+          of: find.byType(StreamMessageRecipientHeader),
+          matching: find.byIcon(ZulipIcons.globe),
+        ).evaluate()).length.equals(1);
+      });
+
+      testWidgets('private streams show lock icon', (tester) async {
+        final stream = eg.stream(inviteOnly: true);
+        await setupMessageListPage(tester,
+          messages: [eg.streamMessage(stream: stream)],
+          subscriptions: [eg.subscription(stream)]);
+        await tester.pump();
+        check(find.descendant(
+          of: find.byType(StreamMessageRecipientHeader),
+          matching: find.byIcon(ZulipIcons.lock),
+        ).evaluate()).length.equals(1);
+      });
+
+      testWidgets('show stream name from message when stream unknown', (tester) async {
+        // This can perfectly well happen, because message fetches can race
+        // with events.
+        // … Though not actually with CombinedFeedNarrow, because that shows
+        // stream messages only in subscribed streams, hence only known streams.
+        // See skip comment below.
+        final stream = eg.stream(name: 'stream name');
+        await setupMessageListPage(tester,
+          narrow: const CombinedFeedNarrow(),
+          subscriptions: [],
+          messages: [
+            eg.streamMessage(stream: stream),
+          ]);
+        await tester.pump();
+        tester.widget(find.text('stream name'));
+      }, skip: true); // TODO(#252) could repro this with search narrows, once we have those
+
+      testWidgets('show stream name from stream data when known', (tester) async {
+        final streamBefore = eg.stream(name: 'old stream name');
+        // TODO(#182) this test would be more realistic using a StreamUpdateEvent
+        final streamAfter = ZulipStream.fromJson({
+          ...(deepToJson(streamBefore) as Map<String, dynamic>),
           'name': 'new stream name',
-        }),
-      ]));
-      await tester.pump();
-      tester.widget(find.text('new stream name'));
+        });
+        await setupMessageListPage(tester,
+          narrow: const CombinedFeedNarrow(),
+          subscriptions: [eg.subscription(streamAfter)],
+          messages: [
+            eg.streamMessage(stream: streamBefore),
+          ]);
+        await tester.pump();
+        tester.widget(find.text('new stream name'));
+      });
     });
 
-    testWidgets('show names on DMs', (tester) async {
-      await setupMessageListPage(tester, messages: [
-        eg.dmMessage(from: eg.selfUser, to: []),
-        eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]),
-        eg.dmMessage(from: eg.thirdUser, to: [eg.selfUser, eg.otherUser]),
-      ]);
-      store.addUser(eg.otherUser);
-      store.addUser(eg.thirdUser);
-      await tester.pump();
-      tester.widget(find.text("You with yourself"));
-      tester.widget(find.text("You and ${eg.otherUser.fullName}"));
-      tester.widget(find.text("You and ${eg.otherUser.fullName}, ${eg.thirdUser.fullName}"));
-    });
+    group('DmRecipientHeader', () {
+      testWidgets('show names', (tester) async {
+        final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+        await setupMessageListPage(tester, messages: [
+          eg.dmMessage(from: eg.selfUser, to: []),
+          eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]),
+          eg.dmMessage(from: eg.thirdUser, to: [eg.selfUser, eg.otherUser]),
+        ]);
+        await store.addUser(eg.otherUser);
+        await store.addUser(eg.thirdUser);
+        await tester.pump();
+        tester.widget(find.text(zulipLocalizations.messageListGroupYouWithYourself));
+        tester.widget(find.text(zulipLocalizations.messageListGroupYouAndOthers(
+          eg.otherUser.fullName)));
+        tester.widget(find.text(zulipLocalizations.messageListGroupYouAndOthers(
+          "${eg.otherUser.fullName}, ${eg.thirdUser.fullName}")));
+      });
 
-    testWidgets('show names on DMs: smoothly handle unknown users', (tester) async {
-      await setupMessageListPage(tester, messages: [
-        eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]),
-        eg.dmMessage(from: eg.thirdUser, to: [eg.selfUser, eg.otherUser]),
-      ]);
-      store.addUser(eg.thirdUser);
-      await tester.pump();
-      tester.widget(find.text("You and (unknown user)"));
-      tester.widget(find.text("You and (unknown user), ${eg.thirdUser.fullName}"));
+      testWidgets('show names: smoothly handle unknown users', (tester) async {
+        final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+        await setupMessageListPage(tester, messages: [
+          eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]),
+          eg.dmMessage(from: eg.thirdUser, to: [eg.selfUser, eg.otherUser]),
+        ]);
+        await store.addUser(eg.thirdUser);
+        await tester.pump();
+        tester.widget(find.text(zulipLocalizations.messageListGroupYouAndOthers(
+          zulipLocalizations.unknownUserName)));
+        tester.widget(find.text(zulipLocalizations.messageListGroupYouAndOthers(
+          "${zulipLocalizations.unknownUserName}, ${eg.thirdUser.fullName}")));
+      });
+
+      testWidgets('icon color matches text color', (tester) async {
+        final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+        await setupMessageListPage(tester, messages: [
+          eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]),
+        ]);
+        await tester.pump();
+        final textSpan = tester.renderObject<RenderParagraph>(find.text(
+          zulipLocalizations.messageListGroupYouAndOthers(
+            zulipLocalizations.unknownUserName))).text;
+        final icon = tester.widget<Icon>(find.byIcon(ZulipIcons.user));
+        check(textSpan).style.isNotNull().color.equals(icon.color);
+      });
     });
 
     testWidgets('show dates', (tester) async {
       await setupMessageListPage(tester, messages: [
         eg.streamMessage(timestamp: 1671409088),
-        eg.dmMessage(timestamp: 1692755322, from: eg.selfUser, to: []),
+        eg.dmMessage(timestamp: 1661219322, from: eg.selfUser, to: []),
       ]);
       // We show the dates in the user's timezone.  Dart's standard library
       // doesn't give us a way to control which timezone is used — only to
@@ -249,9 +449,32 @@ void main() {
       //   https://github.com/dart-lang/sdk/issues/28985 (about DateTime.now, not timezone)
       //   https://github.com/dart-lang/sdk/issues/44928 (about the Dart implementation's own internal tests)
       // For this test, just accept outputs corresponding to any possible timezone.
-      tester.widget(find.textContaining(RegExp("2022-12-1[89]")));
-      tester.widget(find.textContaining(RegExp("2023-08-2[23]")));
+      tester.widget(find.textContaining(RegExp("Dec 1[89], 2022")));
+      tester.widget(find.textContaining(RegExp("Aug 2[23], 2022")));
     });
+  });
+
+  group('formatHeaderDate', () {
+    final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+    final now = DateTime.parse("2023-01-10 12:00");
+    final testCases = [
+      ("2023-01-10 12:00", zulipLocalizations.today),
+      ("2023-01-10 00:00", zulipLocalizations.today),
+      ("2023-01-10 23:59", zulipLocalizations.today),
+      ("2023-01-09 23:59", zulipLocalizations.yesterday),
+      ("2023-01-09 00:00", zulipLocalizations.yesterday),
+      ("2023-01-08 00:00", "Jan 8"),
+      ("2022-12-31 00:00", "Dec 31, 2022"),
+      // Future times
+      ("2023-01-10 19:00", zulipLocalizations.today),
+      ("2023-01-11 00:00", "Jan 11, 2023"),
+    ];
+    for (final (dateTime, expected) in testCases) {
+      test('$dateTime returns $expected', () {
+        check(formatHeaderDate(zulipLocalizations, DateTime.parse(dateTime), now: now))
+          .equals(expected);
+      });
+    }
   });
 
   group('MessageWithPossibleSender', () {
@@ -272,21 +495,16 @@ void main() {
           check(findAvatarImageWidget(tester)).isNull();
         } else {
           check(findAvatarImageWidget(tester)).isNotNull()
-            .src.equals(resolveUrl(avatarUrl, eg.selfAccount));
+            .src.equals(eg.selfAccount.realmUrl.resolve(avatarUrl));
         }
       }
 
       Future<void> handleNewAvatarEventAndPump(WidgetTester tester, String avatarUrl) async {
-        final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
-        store.handleEvent(RealmUserUpdateEvent(id: 1, userId: eg.selfUser.userId, avatarUrl: avatarUrl));
+        await store.handleEvent(RealmUserUpdateEvent(id: 1, userId: eg.selfUser.userId, avatarUrl: avatarUrl));
         await tester.pump();
       }
 
-      final httpClient = FakeImageHttpClient();
-      debugNetworkImageHttpClientProvider = () => httpClient;
-      httpClient.request.response
-        ..statusCode = HttpStatus.ok
-        ..content = kSolidBlueAvatar;
+      prepareBoringImageHttpClient();
 
       await setupMessageListPage(tester, messageCount: 10);
       checkResultForSender(eg.selfUser.avatarUrl);
@@ -298,6 +516,497 @@ void main() {
       checkResultForSender('/bar.jpg');
 
       debugNetworkImageHttpClientProvider = null;
+    });
+
+    testWidgets('Bot user is distinguished by showing an icon', (tester) async {
+      // When using this function, provide only one bot user
+      // to [PerAccountStore] through [setupMessageListPage] function.
+      void checkUser(User user, {required bool isBot}) {
+        final nameFinder = find.text(user.fullName);
+        final botFinder = find.byIcon(ZulipIcons.bot);
+
+        check(nameFinder.evaluate().singleOrNull).isNotNull();
+        check(botFinder.evaluate().singleOrNull).isNotNull();
+
+        final userFinder = find.ancestor(
+          of: nameFinder,
+          matching: find.ancestor(
+            of: botFinder,
+            matching: find.byType(Row),
+          ));
+
+        isBot
+          ? check(userFinder.evaluate()).isNotEmpty()
+          : check(userFinder.evaluate()).isEmpty();
+      }
+
+      prepareBoringImageHttpClient();
+
+      final users = [
+        eg.user(fullName: 'User 1', isBot: true),
+        eg.user(fullName: 'User 2', isBot: false),
+        eg.user(fullName: 'User 3', isBot: false),
+      ];
+
+      await setupMessageListPage(
+        tester,
+        messages: users.map((user) => eg.streamMessage(sender: user)).toList(),
+        users: users,
+      );
+
+      checkUser(users[0], isBot: true);
+      checkUser(users[1], isBot: false);
+      checkUser(users[2], isBot: false);
+
+      debugNetworkImageHttpClientProvider = null;
+    });
+  });
+
+  group('Starred messages', () {
+    testWidgets('unstarred message', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: []);
+      await setupMessageListPage(tester, messages: [message]);
+      check(find.byIcon(ZulipIcons.star_filled).evaluate()).isEmpty();
+    });
+
+    testWidgets('starred message', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: [MessageFlag.starred]);
+      await setupMessageListPage(tester, messages: [message]);
+      check(find.byIcon(ZulipIcons.star_filled).evaluate()).length.equals(1);
+    });
+  });
+
+  group('_UnreadMarker animations', () {
+    // TODO: Improve animation state testing so it is less tied to
+    //   implementation details and more focused on output, see:
+    //   https://chat.zulip.org/#narrow/stream/243-mobile-team/topic/robust.20widget.20finders.20in.20tests/near/1671738
+    Animation<double> getAnimation(WidgetTester tester, int messageId) {
+      final widget = tester.widget<FadeTransition>(find.descendant(
+        of: find.byKey(ValueKey(messageId)),
+        matching: find.byType(FadeTransition)));
+      return widget.opacity;
+    }
+
+    testWidgets('from read to unread', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: [MessageFlag.read]);
+      await setupMessageListPage(tester, messages: [message]);
+      check(getAnimation(tester, message.id))
+        ..value.equals(0.0)
+        ..status.equals(AnimationStatus.dismissed);
+
+      await store.handleEvent(eg.updateMessageFlagsRemoveEvent(
+        MessageFlag.read, [message]));
+      await tester.pump(); // process handleEvent
+      check(getAnimation(tester, message.id))
+        ..value.equals(0.0)
+        ..status.equals(AnimationStatus.forward);
+
+      await tester.pumpAndSettle();
+      check(getAnimation(tester, message.id))
+        ..value.equals(1.0)
+        ..status.equals(AnimationStatus.completed);
+    });
+
+    testWidgets('from unread to read', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: []);
+      await setupMessageListPage(tester, messages: [message]);
+      check(getAnimation(tester, message.id))
+        ..value.equals(1.0)
+        ..status.equals(AnimationStatus.dismissed);
+
+      await store.handleEvent(UpdateMessageFlagsAddEvent(
+        id: 1,
+        flag: MessageFlag.read,
+        messages: [message.id],
+        all: false,
+      ));
+      await tester.pump(); // process handleEvent
+      check(getAnimation(tester, message.id))
+        ..value.equals(1.0)
+        ..status.equals(AnimationStatus.forward);
+
+      await tester.pumpAndSettle();
+      check(getAnimation(tester, message.id))
+        ..value.equals(0.0)
+        ..status.equals(AnimationStatus.completed);
+    });
+
+    testWidgets('animation state persistence', (WidgetTester tester) async {
+      // Check that _UnreadMarker maintains its in-progress animation
+      // as the number of items changes in MessageList. See
+      // `findChildIndexCallback` passed into [SliverStickyHeaderList]
+      // at [_MessageListState._buildListView].
+      final message = eg.streamMessage(flags: []);
+      await setupMessageListPage(tester, messages: [message]);
+      check(getAnimation(tester, message.id))
+        ..value.equals(1.0)
+        ..status.equals(AnimationStatus.dismissed);
+
+      await store.handleEvent(UpdateMessageFlagsAddEvent(
+        id: 0,
+        flag: MessageFlag.read,
+        messages: [message.id],
+        all: false,
+      ));
+      await tester.pump(); // process handleEvent
+      check(getAnimation(tester, message.id))
+        ..value.equals(1.0)
+        ..status.equals(AnimationStatus.forward);
+
+      // run animation partially
+      await tester.pump(const Duration(milliseconds: 30));
+      check(getAnimation(tester, message.id))
+        ..value.isGreaterThan(0.0)
+        ..value.isLessThan(1.0)
+        ..status.equals(AnimationStatus.forward);
+
+      // introduce new message
+      final newMessage = eg.streamMessage(flags:[MessageFlag.read]);
+      await store.handleEvent(MessageEvent(id: 0, message: newMessage));
+      await tester.pump(); // process handleEvent
+      check(find.byType(MessageItem).evaluate()).length.equals(2);
+      check(getAnimation(tester, message.id))
+        ..value.isGreaterThan(0.0)
+        ..value.isLessThan(1.0)
+        ..status.equals(AnimationStatus.forward);
+      check(getAnimation(tester, newMessage.id))
+        ..value.equals(0.0)
+        ..status.equals(AnimationStatus.dismissed);
+
+      final frames = await tester.pumpAndSettle();
+      check(frames).isGreaterThan(1);
+      check(getAnimation(tester, message.id))
+        ..value.equals(0.0)
+        ..status.equals(AnimationStatus.completed);
+      check(getAnimation(tester, newMessage.id))
+        ..value.equals(0.0)
+        ..status.equals(AnimationStatus.dismissed);
+    });
+  });
+
+  group('MarkAsReadWidget', () {
+    bool isMarkAsReadButtonVisible(WidgetTester tester) {
+      final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+      final finder = find.text(
+        zulipLocalizations.markAllAsReadLabel).hitTestable();
+      return finder.evaluate().isNotEmpty;
+    }
+
+    testWidgets('from read to unread', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: [MessageFlag.read]);
+      await setupMessageListPage(tester, messages: [message]);
+      check(isMarkAsReadButtonVisible(tester)).isFalse();
+
+      await store.handleEvent(eg.updateMessageFlagsRemoveEvent(
+        MessageFlag.read, [message]));
+      await tester.pumpAndSettle();
+      check(isMarkAsReadButtonVisible(tester)).isTrue();
+    });
+
+    testWidgets('from unread to read', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: []);
+      final unreadMsgs = eg.unreadMsgs(streams:[
+        UnreadStreamSnapshot(topic: message.topic, streamId: message.streamId, unreadMessageIds: [message.id])
+      ]);
+      await setupMessageListPage(tester, messages: [message], unreadMsgs: unreadMsgs);
+      check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+      await store.handleEvent(UpdateMessageFlagsAddEvent(
+        id: 1,
+        flag: MessageFlag.read,
+        messages: [message.id],
+        all: false,
+      ));
+      await tester.pumpAndSettle();
+      check(isMarkAsReadButtonVisible(tester)).isFalse();
+    });
+
+    testWidgets("messages don't shift position", (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: []);
+      final unreadMsgs = eg.unreadMsgs(streams:[
+        UnreadStreamSnapshot(topic: message.topic, streamId: message.streamId,
+          unreadMessageIds: [message.id])
+      ]);
+      await setupMessageListPage(tester,
+        messages: [message], unreadMsgs: unreadMsgs);
+      check(isMarkAsReadButtonVisible(tester)).isTrue();
+      check(tester.widgetList(find.byType(MessageItem))).length.equals(1);
+      final before = tester.getTopLeft(find.byType(MessageItem)).dy;
+
+      await store.handleEvent(UpdateMessageFlagsAddEvent(
+        id: 1,
+        flag: MessageFlag.read,
+        messages: [message.id],
+        all: false,
+      ));
+      await tester.pumpAndSettle();
+      check(isMarkAsReadButtonVisible(tester)).isFalse();
+      check(tester.widgetList(find.byType(MessageItem))).length.equals(1);
+      final after = tester.getTopLeft(find.byType(MessageItem)).dy;
+      check(after).equals(before);
+    });
+
+    group('onPressed behavior', () {
+      final message = eg.streamMessage(flags: []);
+      final unreadMsgs = eg.unreadMsgs(streams: [
+        UnreadStreamSnapshot(streamId: message.streamId, topic: message.topic,
+          unreadMessageIds: [message.id]),
+      ]);
+
+      testWidgets('smoke test on modern server', (WidgetTester tester) async {
+        final narrow = TopicNarrow.ofMessage(message);
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.prepare(json: UpdateMessageFlagsForNarrowResult(
+          processedCount: 11, updatedCount: 3,
+          firstProcessedId: null, lastProcessedId: null,
+          foundOldest: true, foundNewest: true).toJson());
+        await tester.tap(find.byType(MarkAsReadWidget));
+        final apiNarrow = narrow.apiEncode()..add(ApiNarrowIsUnread());
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/messages/flags/narrow')
+          ..bodyFields.deepEquals({
+              'anchor': 'oldest',
+              'include_anchor': 'false',
+              'num_before': '0',
+              'num_after': '1000',
+              'narrow': jsonEncode(apiNarrow),
+              'op': 'add',
+              'flag': 'read',
+            });
+
+        await tester.pumpAndSettle(); // process pending timers
+      });
+
+      testWidgets('markAllMessagesAsRead uses is:unread optimization', (WidgetTester tester) async {
+        const narrow = CombinedFeedNarrow();
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.prepare(json: UpdateMessageFlagsForNarrowResult(
+          processedCount: 11, updatedCount: 3,
+          firstProcessedId: null, lastProcessedId: null,
+          foundOldest: true, foundNewest: true).toJson());
+        await tester.tap(find.byType(MarkAsReadWidget));
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/messages/flags/narrow')
+          ..bodyFields.deepEquals({
+              'anchor': 'oldest',
+              'include_anchor': 'false',
+              'num_before': '0',
+              'num_after': '1000',
+              'narrow': json.encode([{'operator': 'is', 'operand': 'unread'}]),
+              'op': 'add',
+              'flag': 'read',
+            });
+
+        await tester.pumpAndSettle(); // process pending timers
+      });
+
+      testWidgets('markNarrowAsRead pagination', (WidgetTester tester) async {
+        // Check that `lastProcessedId` returned from an initial
+        // response is used as `anchorId` for the subsequent request.
+        final narrow = TopicNarrow.ofMessage(message);
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.prepare(json: UpdateMessageFlagsForNarrowResult(
+          processedCount: 1000, updatedCount: 890,
+          firstProcessedId: 1, lastProcessedId: 1989,
+          foundOldest: true, foundNewest: false).toJson());
+        await tester.tap(find.byType(MarkAsReadWidget));
+        final apiNarrow = narrow.apiEncode()..add(ApiNarrowIsUnread());
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/messages/flags/narrow')
+          ..bodyFields.deepEquals({
+              'anchor': 'oldest',
+              'include_anchor': 'false',
+              'num_before': '0',
+              'num_after': '1000',
+              'narrow': jsonEncode(apiNarrow),
+              'op': 'add',
+              'flag': 'read',
+            });
+
+        connection.prepare(json: UpdateMessageFlagsForNarrowResult(
+          processedCount: 20, updatedCount: 10,
+          firstProcessedId: 2000, lastProcessedId: 2023,
+          foundOldest: false, foundNewest: true).toJson());
+        await tester.pumpAndSettle();
+        check(find.bySubtype<SnackBar>().evaluate()).length.equals(1);
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/messages/flags/narrow')
+          ..bodyFields.deepEquals({
+              'anchor': '1989',
+              'include_anchor': 'false',
+              'num_before': '0',
+              'num_after': '1000',
+              'narrow': jsonEncode(apiNarrow),
+              'op': 'add',
+              'flag': 'read',
+            });
+      });
+
+      testWidgets('markNarrowAsRead on mark-all-as-read when Unreads.oldUnreadsMissing: true', (tester) async {
+        const narrow = CombinedFeedNarrow();
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+        store.unreads.oldUnreadsMissing = true;
+
+        connection.prepare(json: UpdateMessageFlagsForNarrowResult(
+          processedCount: 11, updatedCount: 3,
+          firstProcessedId: null, lastProcessedId: null,
+          foundOldest: true, foundNewest: true).toJson());
+        await tester.tap(find.byType(MarkAsReadWidget));
+        await tester.pumpAndSettle();
+        check(store.unreads.oldUnreadsMissing).isFalse();
+      });
+
+      testWidgets('markNarrowAsRead on invalid response', (WidgetTester tester) async {
+        final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+        final narrow = TopicNarrow.ofMessage(message);
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.prepare(json: UpdateMessageFlagsForNarrowResult(
+          processedCount: 1000, updatedCount: 0,
+          firstProcessedId: null, lastProcessedId: null,
+          foundOldest: true, foundNewest: false).toJson());
+        await tester.tap(find.byType(MarkAsReadWidget));
+        final apiNarrow = narrow.apiEncode()..add(ApiNarrowIsUnread());
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/messages/flags/narrow')
+          ..bodyFields.deepEquals({
+              'anchor': 'oldest',
+              'include_anchor': 'false',
+              'num_before': '0',
+              'num_after': '1000',
+              'narrow': jsonEncode(apiNarrow),
+              'op': 'add',
+              'flag': 'read',
+            });
+
+        await tester.pumpAndSettle();
+        checkErrorDialog(tester,
+          expectedTitle: zulipLocalizations.errorMarkAsReadFailedTitle,
+          expectedMessage: zulipLocalizations.errorInvalidResponse);
+      });
+
+      testWidgets('CombinedFeedNarrow on legacy server', (WidgetTester tester) async {
+        const narrow = CombinedFeedNarrow();
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        // Might as well test with oldUnreadsMissing: true.
+        store.unreads.oldUnreadsMissing = true;
+
+        connection.zulipFeatureLevel = 154;
+        connection.prepare(json: {});
+        await tester.tap(find.byType(MarkAsReadWidget));
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/mark_all_as_read')
+          ..bodyFields.deepEquals({});
+
+        await tester.pumpAndSettle(); // process pending timers
+
+        // Check that [Unreads.handleAllMessagesReadSuccess] wasn't called;
+        // in the legacy protocol, that'd be redundant with the mark-read event.
+        check(store.unreads).oldUnreadsMissing.isTrue();
+      });
+
+      testWidgets('StreamNarrow on legacy server', (WidgetTester tester) async {
+        final narrow = StreamNarrow(message.streamId);
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.zulipFeatureLevel = 154;
+        connection.prepare(json: {});
+        await tester.tap(find.byType(MarkAsReadWidget));
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/mark_stream_as_read')
+          ..bodyFields.deepEquals({
+              'stream_id': message.streamId.toString(),
+            });
+
+        await tester.pumpAndSettle(); // process pending timers
+      });
+
+      testWidgets('TopicNarrow on legacy server', (WidgetTester tester) async {
+        final narrow = TopicNarrow.ofMessage(message);
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.zulipFeatureLevel = 154;
+        connection.prepare(json: {});
+        await tester.tap(find.byType(MarkAsReadWidget));
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/mark_topic_as_read')
+          ..bodyFields.deepEquals({
+              'stream_id': narrow.streamId.toString(),
+              'topic_name': narrow.topic,
+            });
+
+        await tester.pumpAndSettle(); // process pending timers
+      });
+
+      testWidgets('DmNarrow on legacy server', (WidgetTester tester) async {
+        final message = eg.dmMessage(from: eg.otherUser, to: [eg.selfUser]);
+        final narrow = DmNarrow.ofMessage(message, selfUserId: eg.selfUser.userId);
+        final unreadMsgs = eg.unreadMsgs(dms: [
+          UnreadDmSnapshot(otherUserId: eg.otherUser.userId,
+            unreadMessageIds: [message.id]),
+        ]);
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.zulipFeatureLevel = 154;
+        connection.prepare(json:
+          UpdateMessageFlagsResult(messages: [message.id]).toJson());
+        await tester.tap(find.byType(MarkAsReadWidget));
+        check(connection.lastRequest).isA<http.Request>()
+          ..method.equals('POST')
+          ..url.path.equals('/api/v1/messages/flags')
+          ..bodyFields.deepEquals({
+              'messages': jsonEncode([message.id]),
+              'op': 'add',
+              'flag': 'read',
+            });
+
+        await tester.pumpAndSettle(); // process pending timers
+      });
+
+      testWidgets('catch-all api errors', (WidgetTester tester) async {
+        final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+        const narrow = CombinedFeedNarrow();
+        await setupMessageListPage(tester,
+          narrow: narrow, messages: [message], unreadMsgs: unreadMsgs);
+        check(isMarkAsReadButtonVisible(tester)).isTrue();
+
+        connection.prepare(exception: http.ClientException('Oops'));
+        await tester.tap(find.byType(MarkAsReadWidget));
+        await tester.pumpAndSettle();
+        checkErrorDialog(tester,
+          expectedTitle: zulipLocalizations.errorMarkAsReadFailedTitle,
+          expectedMessage: 'NetworkException: Oops (ClientException: Oops)');
+      });
     });
   });
 }

@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:json_annotation/json_annotation.dart';
 
+import '../../model/algorithms.dart';
 import 'model.dart';
 
 part 'initial_snapshot.g.dart';
@@ -23,6 +24,18 @@ class InitialSnapshot {
 
   final List<CustomProfileField> customProfileFields;
 
+  // TODO(server-8): Remove the default values.
+  @JsonKey(defaultValue: 15000)
+  final int serverTypingStartedExpiryPeriodMilliseconds;
+  @JsonKey(defaultValue: 5000)
+  final int serverTypingStoppedWaitPeriodMilliseconds;
+  @JsonKey(defaultValue: 10000)
+  final int serverTypingStartedWaitPeriodMilliseconds;
+
+  // final List<…> mutedTopics; // TODO(#422) we ignore this feature on older servers
+
+  final Map<String, RealmEmojiItem> realmEmoji;
+
   final List<RecentDmConversation> recentPrivateConversations;
 
   final List<Subscription> subscriptions;
@@ -38,6 +51,8 @@ class InitialSnapshot {
   // even at the expense of functionality with pre-5.0 servers.
   // TODO(server-5) remove pre-5.0 comment
   final UserSettings? userSettings; // TODO(server-5)
+
+  final List<UserTopicItem>? userTopics; // TODO(server-6)
 
   final Map<String, RealmDefaultExternalAccount> realmDefaultExternalAccounts;
 
@@ -56,34 +71,39 @@ class InitialSnapshot {
   // `is_active` is sometimes absent:
   //   https://chat.zulip.org/#narrow/stream/412-api-documentation/topic/.60is_active.60.20in.20.60.2Fregister.60.20response/near/1371603
   // But for our model it's convenient to always have it; so, fill it in.
-  static Object? _readUsersIsActiveFallbackTrue(Map json, String key) {
+  static Object? _readUsersIsActiveFallbackTrue(Map<dynamic, dynamic> json, String key) {
     final list = (json[key] as List<dynamic>);
-    for (final Map<String, dynamic> user in list) {
-      user.putIfAbsent('is_active', () => true);
+    for (final user in list) {
+      (user as Map<String, dynamic>).putIfAbsent('is_active', () => true);
     }
     return list;
   }
-  static Object? _readUsersIsActiveFallbackFalse(Map json, String key) {
+  static Object? _readUsersIsActiveFallbackFalse(Map<dynamic, dynamic> json, String key) {
     final list = (json[key] as List<dynamic>);
-    for (final Map<String, dynamic> user in list) {
-      user.putIfAbsent('is_active', () => false);
+    for (final user in list) {
+      (user as Map<String, dynamic>).putIfAbsent('is_active', () => false);
     }
     return list;
   }
 
   InitialSnapshot({
-    this.queueId,
+    required this.queueId,
     required this.lastEventId,
     required this.zulipFeatureLevel,
     required this.zulipVersion,
-    this.zulipMergeBase,
+    required this.zulipMergeBase,
     required this.alertWords,
     required this.customProfileFields,
+    required this.serverTypingStartedExpiryPeriodMilliseconds,
+    required this.serverTypingStoppedWaitPeriodMilliseconds,
+    required this.serverTypingStartedWaitPeriodMilliseconds,
+    required this.realmEmoji,
     required this.recentPrivateConversations,
     required this.subscriptions,
     required this.unreadMsgs,
     required this.streams,
     required this.userSettings,
+    required this.userTopics,
     required this.realmDefaultExternalAccounts,
     required this.maxFileUploadSizeMib,
     required this.realmUsers,
@@ -173,45 +193,29 @@ class UserSettings {
   static final Iterable<String> debugKnownNames = _$UserSettingsFieldMap.keys;
 }
 
-/// The name of a user setting that has a property in [UserSettings].
+/// An item in the `user_topics` snapshot.
 ///
-/// In Zulip event-handling code (for [UserSettingsUpdateEvent]),
-/// we switch exhaustively on a value of this type
-/// to ensure that every setting in [UserSettings] responds to the event.
-@JsonEnum(fieldRename: FieldRename.snake, alwaysCreate: true)
-enum UserSettingName {
-  twentyFourHourTime,
-  displayEmojiReactionUsers,
-  emojiset;
+/// For docs, search for "user_topics:"
+/// in <https://zulip.com/api/register-queue>.
+@JsonSerializable(fieldRename: FieldRename.snake)
+class UserTopicItem {
+  final int streamId;
+  final String topicName;
+  final int lastUpdated;
+  @JsonKey(unknownEnumValue: UserTopicVisibilityPolicy.unknown)
+  final UserTopicVisibilityPolicy visibilityPolicy;
 
-  /// Get a [UserSettingName] from a raw, snake-case string we recognize, else null.
-  ///
-  /// Example:
-  ///   'display_emoji_reaction_users' -> UserSettingName.displayEmojiReactionUsers
-  static UserSettingName? fromRawString(String raw) => _byRawString[raw];
+  UserTopicItem({
+    required this.streamId,
+    required this.topicName,
+    required this.lastUpdated,
+    required this.visibilityPolicy,
+  });
 
-  // _$…EnumMap is thanks to `alwaysCreate: true` and `fieldRename: FieldRename.snake`
-  static final _byRawString = _$UserSettingNameEnumMap
-    .map((key, value) => MapEntry(value, key));
-}
+  factory UserTopicItem.fromJson(Map<String, dynamic> json) =>
+    _$UserTopicItemFromJson(json);
 
-/// As in [UserSettings.emojiset].
-@JsonEnum(fieldRename: FieldRename.kebab, alwaysCreate: true)
-enum Emojiset {
-  google,
-  googleBlob,
-  twitter,
-  text;
-
-  /// Get an [Emojiset] from a raw string. Throws if the string is unrecognized.
-  ///
-  /// Example:
-  ///   'google-blob' -> Emojiset.googleBlob
-  static Emojiset fromRawString(String raw) => _byRawString[raw]!;
-
-  // _$…EnumMap is thanks to `alwaysCreate: true` and `fieldRename: FieldRename.kebab`
-  static final _byRawString = _$EmojisetEnumMap
-    .map((key, value) => MapEntry(value, key));
+  Map<String, dynamic> toJson() => _$UserTopicItemToJson(this);
 }
 
 /// The `unread_msgs` snapshot.
@@ -227,10 +231,13 @@ class UnreadMessagesSnapshot {
 
   final List<UnreadStreamSnapshot> streams;
   final List<UnreadHuddleSnapshot> huddles;
+
+  // Unlike other lists of message IDs here, [mentions] is *not* sorted.
   final List<int> mentions;
+
   final bool oldUnreadsMissing;
 
-  UnreadMessagesSnapshot({
+  const UnreadMessagesSnapshot({
     required this.count,
     required this.dms,
     required this.streams,
@@ -253,14 +260,14 @@ class UnreadDmSnapshot {
   final List<int> unreadMessageIds;
 
   // TODO(server-5): Simplify away.
-  static _readOtherUserId(Map json, String key) {
+  static dynamic _readOtherUserId(Map<dynamic, dynamic> json, String key) {
     return json[key] ?? json['sender_id'];
   }
 
   UnreadDmSnapshot({
     required this.otherUserId,
     required this.unreadMessageIds,
-  });
+  }) : assert(isSortedWithoutDuplicates(unreadMessageIds));
 
   factory UnreadDmSnapshot.fromJson(Map<String, dynamic> json) =>
     _$UnreadDmSnapshotFromJson(json);
@@ -279,7 +286,7 @@ class UnreadStreamSnapshot {
     required this.topic,
     required this.streamId,
     required this.unreadMessageIds,
-  });
+  }) : assert(isSortedWithoutDuplicates(unreadMessageIds));
 
   factory UnreadStreamSnapshot.fromJson(Map<String, dynamic> json) =>
     _$UnreadStreamSnapshotFromJson(json);
@@ -296,7 +303,7 @@ class UnreadHuddleSnapshot {
   UnreadHuddleSnapshot({
     required this.userIdsString,
     required this.unreadMessageIds,
-  });
+  }) : assert(isSortedWithoutDuplicates(unreadMessageIds));
 
   factory UnreadHuddleSnapshot.fromJson(Map<String, dynamic> json) =>
     _$UnreadHuddleSnapshotFromJson(json);

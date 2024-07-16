@@ -2,6 +2,7 @@ import 'package:checks/checks.dart';
 import 'package:test/scaffolding.dart';
 import 'package:zulip/model/compose.dart';
 import 'package:zulip/model/narrow.dart';
+import 'package:zulip/model/internal_link.dart';
 
 import '../example_data.dart' as eg;
 import 'test_store.dart';
@@ -94,9 +95,10 @@ world
     });
 
     test('whitespace around info string', () {
+      const infoString = ' javascript ';
       checkFenceWrap('''
 ````
-``` javascript 
+```$infoString
 // hello world
 ```
 ````
@@ -221,12 +223,12 @@ hello
   });
 
   group('narrowLink', () {
-    test('AllMessagesNarrow', () {
+    test('CombinedFeedNarrow', () {
       final store = eg.store();
-      check(narrowLink(store, const AllMessagesNarrow()))
-        .equals(store.account.realmUrl.resolve('#narrow'));
-      check(narrowLink(store, const AllMessagesNarrow(), nearMessageId: 1))
-        .equals(store.account.realmUrl.resolve('#narrow/near/1'));
+      check(narrowLink(store, const CombinedFeedNarrow()))
+        .equals(store.realmUrl.resolve('#narrow'));
+      check(narrowLink(store, const CombinedFeedNarrow(), nearMessageId: 1))
+        .equals(store.realmUrl.resolve('#narrow/near/1'));
     });
 
     test('StreamNarrow / TopicNarrow', () {
@@ -235,15 +237,15 @@ hello
         required String name,
         String? topic,
         int? nearMessageId,
-      }) {
+      }) async {
         assert(expectedFragment.startsWith('#'), 'wrong-looking expectedFragment');
         final store = eg.store();
-        store.addStream(eg.stream(streamId: streamId, name: name));
+        await store.addStream(eg.stream(streamId: streamId, name: name));
         final narrow = topic == null
           ? StreamNarrow(streamId)
           : TopicNarrow(streamId, topic);
         check(narrowLink(store, narrow, nearMessageId: nearMessageId))
-          .equals(store.account.realmUrl.resolve(expectedFragment));
+          .equals(store.realmUrl.resolve(expectedFragment));
       }
 
       checkNarrow(streamId: 1,   name: 'announce',       '#narrow/stream/1-announce');
@@ -274,10 +276,10 @@ hello
         final store = eg.store();
         final narrow = DmNarrow(allRecipientIds: allRecipientIds, selfUserId: selfUserId);
         check(narrowLink(store, narrow, nearMessageId: nearMessageId))
-          .equals(store.account.realmUrl.resolve(expectedFragment));
+          .equals(store.realmUrl.resolve(expectedFragment));
         store.connection.zulipFeatureLevel = 176;
         check(narrowLink(store, narrow, nearMessageId: nearMessageId))
-          .equals(store.account.realmUrl.resolve(legacyExpectedFragment));
+          .equals(store.realmUrl.resolve(legacyExpectedFragment));
       }
 
       checkNarrow(allRecipientIds: [1], selfUserId: 1,
@@ -309,14 +311,19 @@ hello
     test('silent', () {
       check(mention(user, silent: true)).equals('@_**Full Name|123**');
     });
-    test('`users` passed; has two users with same fullName', () {
+    test('`users` passed; has two users with same fullName', () async {
       final store = eg.store();
-      store.addUsers([user, eg.user(userId: 5), eg.user(userId: 234, fullName: user.fullName)]);
+      await store.addUsers([user, eg.user(userId: 5), eg.user(userId: 234, fullName: user.fullName)]);
       check(mention(user, silent: true, users: store.users)).equals('@_**Full Name|123**');
     });
-    test('`users` passed; user has unique fullName', () {
+    test('`users` passed; has two same-name users but one of them is deactivated', () async {
       final store = eg.store();
-      store.addUsers([user, eg.user(userId: 234, fullName: 'Another Name')]);
+      await store.addUsers([user, eg.user(userId: 5), eg.user(userId: 234, fullName: user.fullName, isActive: false)]);
+      check(mention(user, silent: true, users: store.users)).equals('@_**Full Name|123**');
+    });
+    test('`users` passed; user has unique fullName', () async {
+      final store = eg.store();
+      await store.addUsers([user, eg.user(userId: 234, fullName: 'Another Name')]);
       check(mention(user, silent: true, users: store.users)).equals('@_**Full Name**');
     });
   });
@@ -328,13 +335,13 @@ hello
       .equals('[IMG_2488.png](/user_uploads/2/a3/ucEMyjxk90mcNF0y9rmW5XKO/IMG_2488.png)');
   });
 
-  test('quoteAndReply / quoteAndReplyPlaceholder', () {
+  test('quoteAndReply / quoteAndReplyPlaceholder', () async {
     final sender = eg.user(userId: 123, fullName: 'Full Name');
     final stream = eg.stream(streamId: 1, name: 'test here');
     final message = eg.streamMessage(sender: sender, stream: stream, topic: 'some topic');
     final store = eg.store();
-    store.addStream(stream);
-    store.addUser(sender);
+    await store.addStream(stream);
+    await store.addUser(sender);
 
     check(quoteAndReplyPlaceholder(store, message: message)).equals('''
 @_**Full Name|123** [said](${eg.selfAccount.realmUrl}#narrow/stream/1-test-here/topic/some.20topic/near/${message.id}): *(loading message ${message.id})*

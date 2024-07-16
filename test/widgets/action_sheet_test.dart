@@ -1,24 +1,35 @@
+import 'dart:convert';
+
 import 'package:checks/checks.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:zulip/api/model/model.dart';
 import 'package:zulip/api/route/messages.dart';
+import 'package:zulip/model/binding.dart';
 import 'package:zulip/model/compose.dart';
+import 'package:zulip/model/internal_link.dart';
+import 'package:zulip/model/localizations.dart';
 import 'package:zulip/model/narrow.dart';
 import 'package:zulip/model/store.dart';
 import 'package:zulip/widgets/compose_box.dart';
 import 'package:zulip/widgets/content.dart';
+import 'package:zulip/widgets/icons.dart';
 import 'package:zulip/widgets/message_list.dart';
 import 'package:zulip/widgets/store.dart';
+import 'package:share_plus_platform_interface/method_channel/method_channel_share.dart';
+import 'package:zulip/widgets/theme.dart';
 import '../api/fake_api.dart';
 
 import '../example_data.dart' as eg;
 import '../flutter_checks.dart';
 import '../model/binding.dart';
 import '../model/test_store.dart';
+import '../stdlib_checks.dart';
 import '../test_clipboard.dart';
+import '../test_share_plus.dart';
 import 'compose_box_checks.dart';
 import 'dialog_checks.dart';
 
@@ -31,9 +42,11 @@ Future<void> setupToMessageActionSheet(WidgetTester tester, {
 
   await testBinding.globalStore.add(eg.selfAccount, eg.initialSnapshot());
   final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
-  store.addUser(eg.user(userId: message.senderId));
+  await store.addUser(eg.user(userId: message.senderId));
   if (message is StreamMessage) {
-    store.addStream(eg.stream(streamId: message.streamId));
+    final stream = eg.stream(streamId: message.streamId);
+    await store.addStream(stream);
+    await store.addSubscription(eg.subscription(stream));
   }
   final connection = store.connection as FakeApiConnection;
 
@@ -47,14 +60,15 @@ Future<void> setupToMessageActionSheet(WidgetTester tester, {
     messages: [message],
   ).toJson());
 
-  await tester.pumpWidget(
+  await tester.pumpWidget(Builder(builder: (context) =>
     MaterialApp(
+      theme: zulipThemeData(context),
       localizationsDelegates: ZulipLocalizations.localizationsDelegates,
       supportedLocales: ZulipLocalizations.supportedLocales,
       home: GlobalStoreWidget(
         child: PerAccountStoreWidget(
           accountId: eg.selfAccount.id,
-          child: MessageListPage(narrow: narrow)))));
+          child: MessageListPage(narrow: narrow))))));
 
   // global store, per-account store, and message list get loaded
   await tester.pumpAndSettle();
@@ -67,15 +81,17 @@ Future<void> setupToMessageActionSheet(WidgetTester tester, {
 
 void main() {
   TestZulipBinding.ensureInitialized();
+  TestWidgetsFlutterBinding.ensureInitialized();
 
   void prepareRawContentResponseSuccess(PerAccountStore store, {
     required Message message,
     required String rawContent,
+    Duration delay = Duration.zero,
   }) {
     // Prepare fetch-raw-Markdown response
     // TODO: Message should really only differ from `message`
     //   in its content / content_type, not in `id` or anything else.
-    (store.connection as FakeApiConnection).prepare(json:
+    (store.connection as FakeApiConnection).prepare(delay: delay, json:
       GetMessageResult(message: eg.streamMessage(contentMarkdown: rawContent)).toJson());
   }
 
@@ -87,6 +103,150 @@ void main() {
     };
     (store.connection as FakeApiConnection).prepare(httpStatus: 400, json: fakeResponseJson);
   }
+
+  group('AddThumbsUpButton', () {
+    Future<void> tapButton(WidgetTester tester) async {
+      await tester.ensureVisible(find.byIcon(Icons.add_reaction_outlined, skipOffstage: false));
+      await tester.tap(find.byIcon(Icons.add_reaction_outlined));
+      await tester.pump(); // [MenuItemButton.onPressed] called in a post-frame callback: flutter/flutter@e4a39fa2e
+    }
+
+    testWidgets('success', (WidgetTester tester) async {
+      final message = eg.streamMessage();
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      final connection = store.connection as FakeApiConnection;
+      connection.prepare(json: {});
+      await tapButton(tester);
+      await tester.pump(Duration.zero);
+
+      check(connection.lastRequest).isA<http.Request>()
+        ..method.equals('POST')
+        ..url.path.equals('/api/v1/messages/${message.id}/reactions')
+        ..bodyFields.deepEquals({
+            'reaction_type': 'unicode_emoji',
+            'emoji_code': '1f44d',
+            'emoji_name': '+1',
+          });
+    });
+
+    testWidgets('request has an error', (WidgetTester tester) async {
+      final message = eg.streamMessage();
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      final connection = store.connection as FakeApiConnection;
+
+      connection.prepare(httpStatus: 400, json: {
+        'code': 'BAD_REQUEST',
+        'msg': 'Invalid message(s)',
+        'result': 'error',
+      });
+      await tapButton(tester);
+      await tester.pump(Duration.zero); // error arrives; error dialog shows
+
+      await tester.tap(find.byWidget(checkErrorDialog(tester,
+        expectedTitle: 'Adding reaction failed',
+        expectedMessage: 'Invalid message(s)')));
+    });
+  });
+
+  group('StarButton', () {
+    Future<void> tapButton(WidgetTester tester) async {
+      // Starred messages include the same icon so we need to
+      // match only by descendants of [BottomSheet].
+      await tester.ensureVisible(find.descendant(
+        of: find.byType(BottomSheet),
+        matching: find.byIcon(ZulipIcons.star_filled, skipOffstage: false)));
+      await tester.tap(find.descendant(
+        of: find.byType(BottomSheet),
+        matching: find.byIcon(ZulipIcons.star_filled)));
+      await tester.pump(); // [MenuItemButton.onPressed] called in a post-frame callback: flutter/flutter@e4a39fa2e
+    }
+
+    testWidgets('star success', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: []);
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      final connection = store.connection as FakeApiConnection;
+      connection.prepare(json: {});
+      await tapButton(tester);
+      await tester.pump(Duration.zero);
+
+      check(connection.lastRequest).isA<http.Request>()
+        ..method.equals('POST')
+        ..url.path.equals('/api/v1/messages/flags')
+        ..bodyFields.deepEquals({
+          'messages': jsonEncode([message.id]),
+          'op': 'add',
+          'flag': 'starred',
+        });
+    });
+
+    testWidgets('unstar success', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: [MessageFlag.starred]);
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      final connection = store.connection as FakeApiConnection;
+      connection.prepare(json: {});
+      await tapButton(tester);
+      await tester.pump(Duration.zero);
+
+      check(connection.lastRequest).isA<http.Request>()
+        ..method.equals('POST')
+        ..url.path.equals('/api/v1/messages/flags')
+        ..bodyFields.deepEquals({
+          'messages': jsonEncode([message.id]),
+          'op': 'remove',
+          'flag': 'starred',
+        });
+    });
+
+    testWidgets('star request has an error', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: []);
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+      final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+
+      final connection = store.connection as FakeApiConnection;
+
+      connection.prepare(httpStatus: 400, json: {
+        'code': 'BAD_REQUEST',
+        'msg': 'Invalid message(s)',
+        'result': 'error',
+      });
+      await tapButton(tester);
+      await tester.pump(Duration.zero); // error arrives; error dialog shows
+
+      await tester.tap(find.byWidget(checkErrorDialog(tester,
+        expectedTitle: zulipLocalizations.errorStarMessageFailedTitle,
+        expectedMessage: 'Invalid message(s)')));
+    });
+
+    testWidgets('unstar request has an error', (WidgetTester tester) async {
+      final message = eg.streamMessage(flags: [MessageFlag.starred]);
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+      final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+
+      final connection = store.connection as FakeApiConnection;
+
+      connection.prepare(httpStatus: 400, json: {
+        'code': 'BAD_REQUEST',
+        'msg': 'Invalid message(s)',
+        'result': 'error',
+      });
+      await tapButton(tester);
+      await tester.pump(Duration.zero); // error arrives; error dialog shows
+
+      await tester.tap(find.byWidget(checkErrorDialog(tester,
+        expectedTitle: zulipLocalizations.errorUnstarMessageFailedTitle,
+        expectedMessage: 'Invalid message(s)')));
+    });
+  });
 
   group('QuoteAndReplyButton', () {
     ComposeBoxController? findComposeBoxController(WidgetTester tester) {
@@ -102,6 +262,7 @@ void main() {
     ///
     /// Checks that there is a quote-and-reply button.
     Future<void> tapQuoteAndReplyButton(WidgetTester tester) async {
+      await tester.ensureVisible(find.byIcon(Icons.format_quote_outlined, skipOffstage: false));
       final quoteAndReplyButton = findQuoteAndReplyButton(tester);
       check(quoteAndReplyButton).isNotNull();
       await tester.tap(find.byWidget(quoteAndReplyButton!));
@@ -133,7 +294,7 @@ void main() {
         builder.selection = TextSelection.collapsed(offset: builder.text.length);
       }
       check(contentController).value.equals(builder.value);
-      check(contentController).not(it()..validationErrors.contains(ContentValidationError.quoteAndReplyInProgress));
+      check(contentController).not((it) => it.validationErrors.contains(ContentValidationError.quoteAndReplyInProgress));
     }
 
     testWidgets('in stream narrow', (WidgetTester tester) async {
@@ -220,28 +381,22 @@ void main() {
       ));
     });
 
-    testWidgets('not offered in AllMessagesNarrow (composing to reply is not yet supported)', (WidgetTester tester) async {
+    testWidgets('not offered in CombinedFeedNarrow (composing to reply is not yet supported)', (WidgetTester tester) async {
       final message = eg.streamMessage();
-      await setupToMessageActionSheet(tester, message: message, narrow: const AllMessagesNarrow());
+      await setupToMessageActionSheet(tester, message: message, narrow: const CombinedFeedNarrow());
       check(findQuoteAndReplyButton(tester)).isNull();
     });
   });
 
-  group('CopyButton', () {
+  group('CopyMessageTextButton', () {
     setUp(() async {
-      TestZulipBinding.ensureInitialized();
-      TestWidgetsFlutterBinding.ensureInitialized();
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
         SystemChannels.platform,
         MockClipboard().handleMethodCall,
       );
     });
 
-    tearDown(() async {
-      testBinding.reset();
-    });
-
-    Future<void> tapCopyButton(WidgetTester tester) async {
+    Future<void> tapCopyMessageTextButton(WidgetTester tester) async {
       await tester.ensureVisible(find.byIcon(Icons.copy, skipOffstage: false));
       await tester.tap(find.byIcon(Icons.copy));
       await tester.pump(); // [MenuItemButton.onPressed] called in a post-frame callback: flutter/flutter@e4a39fa2e
@@ -253,9 +408,34 @@ void main() {
       final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
 
       prepareRawContentResponseSuccess(store, message: message, rawContent: 'Hello world');
-      await tapCopyButton(tester);
+      await tapCopyMessageTextButton(tester);
       await tester.pump(Duration.zero);
       check(await Clipboard.getData('text/plain')).isNotNull().text.equals('Hello world');
+    });
+
+    testWidgets('can show snackbar on success', (tester) async {
+      // Regression test for: https://github.com/zulip/zulip-flutter/issues/732
+      testBinding.deviceInfoResult = const IosDeviceInfo(systemVersion: '16.0');
+
+      final message = eg.streamMessage();
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      // Make the request take a bit of time to complete…
+      prepareRawContentResponseSuccess(store, message: message, rawContent: 'Hello world',
+        delay: const Duration(milliseconds: 500));
+      await tapCopyMessageTextButton(tester);
+      // … and pump a frame to finish the NavigationState.pop animation…
+      await tester.pump(const Duration(milliseconds: 250));
+      // … before the request finishes.  This is the repro condition for #732.
+      await tester.pump(const Duration(milliseconds: 250));
+
+      final snackbar = tester.widget<SnackBar>(find.byType(SnackBar));
+      check(snackbar.behavior).equals(SnackBarBehavior.floating);
+      final zulipLocalizations = GlobalLocalizations.zulipLocalizations;
+      tester.widget(find.descendant(matchRoot: true,
+        of: find.byWidget(snackbar.content),
+        matching: find.text(zulipLocalizations.successMessageTextCopied)));
     });
 
     testWidgets('request has an error', (WidgetTester tester) async {
@@ -264,7 +444,7 @@ void main() {
       final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
 
       prepareRawContentResponseError(store);
-      await tapCopyButton(tester);
+      await tapCopyMessageTextButton(tester);
       await tester.pump(Duration.zero); // error arrives; error dialog shows
 
       await tester.tap(find.byWidget(checkErrorDialog(tester,
@@ -272,6 +452,97 @@ void main() {
         expectedMessage: 'That message does not seem to exist.',
       )));
       check(await Clipboard.getData('text/plain')).isNull();
+    });
+  });
+
+  group('CopyMessageLinkButton', () {
+    setUp(() async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        MockClipboard().handleMethodCall,
+      );
+    });
+
+    Future<void> tapCopyMessageLinkButton(WidgetTester tester) async {
+      await tester.ensureVisible(find.byIcon(Icons.link, skipOffstage: false));
+      await tester.tap(find.byIcon(Icons.link));
+      await tester.pump(); // [MenuItemButton.onPressed] called in a post-frame callback: flutter/flutter@e4a39fa2e
+    }
+
+    testWidgets('copies message link to clipboard', (tester) async {
+      final message = eg.streamMessage();
+      final narrow = TopicNarrow.ofMessage(message);
+      await setupToMessageActionSheet(tester, message: message, narrow: narrow);
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      await tapCopyMessageLinkButton(tester);
+      await tester.pump(Duration.zero);
+      final expectedLink = narrowLink(store, narrow, nearMessageId: message.id).toString();
+      check(await Clipboard.getData('text/plain')).isNotNull().text.equals(expectedLink);
+    });
+  });
+
+  group('ShareButton', () {
+    // Tests should call this.
+    MockSharePlus setupMockSharePlus() {
+      final mock = MockSharePlus();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        MethodChannelShare.channel,
+        mock.handleMethodCall,
+      );
+      return mock;
+    }
+
+    Future<void> tapShareButton(WidgetTester tester) async {
+      await tester.ensureVisible(find.byIcon(Icons.adaptive.share, skipOffstage: false));
+      await tester.tap(find.byIcon(Icons.adaptive.share));
+      await tester.pump(); // [MenuItemButton.onPressed] called in a post-frame callback: flutter/flutter@e4a39fa2e
+    }
+
+    testWidgets('request succeeds; sharing succeeds', (WidgetTester tester) async {
+      final mockSharePlus = setupMockSharePlus();
+      final message = eg.streamMessage();
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      prepareRawContentResponseSuccess(store, message: message, rawContent: 'Hello world');
+      await tapShareButton(tester);
+      await tester.pump(Duration.zero);
+      check(mockSharePlus.sharedString).equals('Hello world');
+    });
+
+    testWidgets('request succeeds; sharing fails', (WidgetTester tester) async {
+      final mockSharePlus = setupMockSharePlus();
+      final message = eg.streamMessage();
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      prepareRawContentResponseSuccess(store, message: message, rawContent: 'Hello world');
+      mockSharePlus.resultString = 'dev.fluttercommunity.plus/share/unavailable';
+      await tapShareButton(tester);
+      await tester.pump(Duration.zero);
+      check(mockSharePlus.sharedString).equals('Hello world');
+      await tester.pump();
+      await tester.tap(find.byWidget(checkErrorDialog(tester,
+        expectedTitle: 'Sharing failed')));
+    });
+
+    testWidgets('request has an error', (WidgetTester tester) async {
+      final mockSharePlus = setupMockSharePlus();
+      final message = eg.streamMessage();
+      await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
+      final store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
+
+      prepareRawContentResponseError(store);
+      await tapShareButton(tester);
+      await tester.pump(Duration.zero); // error arrives; error dialog shows
+
+      await tester.tap(find.byWidget(checkErrorDialog(tester,
+        expectedTitle: 'Sharing failed',
+        expectedMessage: 'That message does not seem to exist.',
+      )));
+
+      check(mockSharePlus.sharedString).isNull();
     });
   });
 }

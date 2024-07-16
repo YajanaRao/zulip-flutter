@@ -2,9 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gen/gen_l10n/zulip_localizations.dart';
 import 'package:intl/intl.dart';
+import 'package:video_player/video_player.dart';
 
+import '../api/core.dart';
 import '../api/model/model.dart';
+import '../log.dart';
 import 'content.dart';
+import 'dialog.dart';
 import 'page.dart';
 import 'clipboard.dart';
 import 'store.dart';
@@ -83,28 +87,32 @@ class _CopyLinkButton extends StatelessWidget {
   }
 }
 
-class _LightboxPage extends StatefulWidget {
-  const _LightboxPage({
+class _LightboxPageLayout extends StatefulWidget {
+  const _LightboxPageLayout({
     required this.routeEntranceAnimation,
     required this.message,
-    required this.src,
+    required this.buildBottomAppBar,
+    required this.child,
   });
 
-  final Animation routeEntranceAnimation;
+  final Animation<double> routeEntranceAnimation;
   final Message message;
-  final Uri src;
+  final Widget? Function(
+    BuildContext context, Color color, double elevation) buildBottomAppBar;
+  final Widget child;
 
   @override
-  State<_LightboxPage> createState() => _LightboxPageState();
+  State<_LightboxPageLayout> createState() => _LightboxPageLayoutState();
 }
 
-class _LightboxPageState extends State<_LightboxPage> {
+class _LightboxPageLayoutState extends State<_LightboxPageLayout> {
   // TODO(#38): Animate entrance/exit of header and footer
   bool _headerFooterVisible = false;
 
   @override
   void initState() {
     super.initState();
+    _handleRouteEntranceAnimationStatusChange(widget.routeEntranceAnimation.status);
     widget.routeEntranceAnimation.addStatusListener(_handleRouteEntranceAnimationStatusChange);
   }
 
@@ -133,6 +141,7 @@ class _LightboxPageState extends State<_LightboxPage> {
 
     final appBarBackgroundColor = Colors.grey.shade900.withOpacity(0.87);
     const appBarForegroundColor = Colors.white;
+    const appBarElevation = 0.0;
 
     PreferredSizeWidget? appBar;
     if (_headerFooterVisible) {
@@ -146,6 +155,8 @@ class _LightboxPageState extends State<_LightboxPage> {
         centerTitle: false,
         foregroundColor: appBarForegroundColor,
         backgroundColor: appBarBackgroundColor,
+        shape: const Border(), // Remove bottom border from [AppBarTheme]
+        elevation: appBarElevation,
 
         // TODO(#41): Show message author's avatar
         title: RichText(
@@ -165,13 +176,8 @@ class _LightboxPageState extends State<_LightboxPage> {
 
     Widget? bottomAppBar;
     if (_headerFooterVisible) {
-      bottomAppBar = BottomAppBar(
-        color: appBarBackgroundColor,
-        child: Row(children: [
-          _CopyLinkButton(url: widget.src),
-          // TODO(#43): Share image
-          // TODO(#42): Download image
-        ]));
+      bottomAppBar = widget.buildBottomAppBar(
+        context, appBarBackgroundColor, appBarElevation);
     }
 
     return Theme(
@@ -182,6 +188,7 @@ class _LightboxPageState extends State<_LightboxPage> {
         extendBody: true, // For the BottomAppBar
         extendBodyBehindAppBar: true, // For the AppBar
         appBar: appBar,
+        bottomNavigationBar: bottomAppBar,
         body: MediaQuery(
           // Clobber the MediaQueryData prepared by Scaffold with one that's not
           // affected by the app bars. On this screen, the app bars are
@@ -193,23 +200,294 @@ class _LightboxPageState extends State<_LightboxPage> {
           child: GestureDetector(
             behavior: HitTestBehavior.translucent,
             onTap: _handleTap,
-            child: SizedBox.expand(
-              child: InteractiveViewer(
-                child: SafeArea(
-                  child: LightboxHero(
-                    message: widget.message,
-                    src: widget.src,
-                    child: RealmContentNetworkImage(widget.src, filterQuality: FilterQuality.medium))))))),
-        bottomNavigationBar: bottomAppBar));
+            child: widget.child))));
   }
 }
 
-Route getLightboxRoute({
-  required BuildContext context,
+class _ImageLightboxPage extends StatefulWidget {
+  const _ImageLightboxPage({
+    required this.routeEntranceAnimation,
+    required this.message,
+    required this.src,
+  });
+
+  final Animation<double> routeEntranceAnimation;
+  final Message message;
+  final Uri src;
+
+  @override
+  State<_ImageLightboxPage> createState() => _ImageLightboxPageState();
+}
+
+class _ImageLightboxPageState extends State<_ImageLightboxPage> {
+  Widget _buildBottomAppBar(BuildContext context, Color color, double elevation) {
+    return BottomAppBar(
+      color: color,
+      elevation: elevation,
+      child: Row(children: [
+        _CopyLinkButton(url: widget.src),
+        // TODO(#43): Share image
+        // TODO(#42): Download image
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _LightboxPageLayout(
+      routeEntranceAnimation: widget.routeEntranceAnimation,
+      message: widget.message,
+      buildBottomAppBar: _buildBottomAppBar,
+      child: SizedBox.expand(
+        child: InteractiveViewer(
+          child: SafeArea(
+            child: LightboxHero(
+              message: widget.message,
+              src: widget.src,
+              child: RealmContentNetworkImage(widget.src, filterQuality: FilterQuality.medium))))));
+  }
+}
+
+class VideoDurationLabel extends StatelessWidget {
+  const VideoDurationLabel(this.duration, {
+    super.key,
+    this.semanticsLabel,
+  });
+
+  final Duration duration;
+  final String? semanticsLabel;
+
+  @visibleForTesting
+  static String formatDuration(Duration value) {
+    final hours = value.inHours.toString().padLeft(2, '0');
+    final minutes = value.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = value.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '${hours == '00' ? '' : '$hours:'}$minutes:$seconds';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(formatDuration(duration),
+      semanticsLabel: semanticsLabel,
+      style: const TextStyle(color: Colors.white));
+  }
+}
+
+class _VideoPositionSliderControl extends StatefulWidget {
+  final VideoPlayerController controller;
+
+  const _VideoPositionSliderControl({
+    required this.controller,
+  });
+
+  @override
+  State<_VideoPositionSliderControl> createState() => _VideoPositionSliderControlState();
+}
+
+class _VideoPositionSliderControlState extends State<_VideoPositionSliderControl> {
+  Duration _sliderValue = Duration.zero;
+  bool _isSliderDragging = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _sliderValue = widget.controller.value.position;
+    widget.controller.addListener(_handleVideoControllerUpdate);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleVideoControllerUpdate);
+    super.dispose();
+  }
+
+  void _handleVideoControllerUpdate() {
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentPosition = _isSliderDragging
+      ? _sliderValue
+      : widget.controller.value.position;
+
+    return Row(children: [
+      VideoDurationLabel(currentPosition,
+        semanticsLabel: "Current position"),
+      Expanded(
+        child: Slider(
+          value: currentPosition.inMilliseconds.toDouble(),
+          max: widget.controller.value.duration.inMilliseconds.toDouble(),
+          activeColor: Colors.white,
+          onChangeStart: (value) {
+            setState(() {
+              _sliderValue = Duration(milliseconds: value.toInt());
+              _isSliderDragging = true;
+            });
+          },
+          onChanged: (value) {
+            setState(() {
+              _sliderValue = Duration(milliseconds: value.toInt());
+            });
+          },
+          onChangeEnd: (value) async {
+            final durationValue = Duration(milliseconds: value.toInt());
+            await widget.controller.seekTo(durationValue);
+            if (mounted) {
+              setState(() {
+                _sliderValue = durationValue;
+                _isSliderDragging = false;
+              });
+            }
+          },
+        ),
+      ),
+      VideoDurationLabel(widget.controller.value.duration,
+        semanticsLabel: "Video duration"),
+    ]);
+  }
+}
+
+class VideoLightboxPage extends StatefulWidget {
+  const VideoLightboxPage({
+    super.key,
+    required this.routeEntranceAnimation,
+    required this.message,
+    required this.src,
+  });
+
+  final Animation<double> routeEntranceAnimation;
+  final Message message;
+  final Uri src;
+
+  @override
+  State<VideoLightboxPage> createState() => _VideoLightboxPageState();
+}
+
+class _VideoLightboxPageState extends State<VideoLightboxPage> with PerAccountStoreAwareStateMixin<VideoLightboxPage> {
+  VideoPlayerController? _controller;
+
+  @override
+  void onNewStore() {
+    if (_controller != null) {
+      // The exclusion of reinitialization logic is deliberate here,
+      // as initialization relies only on the initial values of the store's
+      // realm URL and the user's credentials, which we assume remain unchanged
+      // when the store is replaced.
+      return;
+    }
+
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    final store = PerAccountStoreWidget.of(context);
+
+    assert(debugLog('VideoPlayerController.networkUrl(${widget.src})'));
+    _controller = VideoPlayerController.networkUrl(widget.src, httpHeaders: {
+      if (widget.src.origin == store.account.realmUrl.origin) ...authHeader(
+        email: store.account.email,
+        apiKey: store.account.apiKey,
+      ),
+      ...userAgentHeader()
+    });
+    _controller!.addListener(_handleVideoControllerUpdate);
+
+    try {
+      await _controller!.initialize();
+      if (_controller == null) return; // widget was disposed
+      await _controller!.play();
+    } catch (error) { // TODO(log)
+      assert(debugLog("VideoPlayerController.initialize failed: $error"));
+      if (mounted) {
+        final zulipLocalizations = ZulipLocalizations.of(context);
+        await showErrorDialog(
+          context: context,
+          title: zulipLocalizations.errorDialogTitle,
+          message: zulipLocalizations.errorVideoPlayerFailed,
+          onDismiss: () {
+            Navigator.pop(context); // Pops the dialog
+            Navigator.pop(context); // Pops the lightbox
+          });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.removeListener(_handleVideoControllerUpdate);
+    _controller?.dispose();
+    _controller = null;
+    super.dispose();
+  }
+
+  void _handleVideoControllerUpdate() {
+    setState(() {});
+  }
+
+  Widget? _buildBottomAppBar(BuildContext context, Color color, double elevation) {
+    if (_controller == null) return null;
+    return BottomAppBar(
+      height: 150,
+      color: color,
+      elevation: elevation,
+      child: Column(mainAxisAlignment: MainAxisAlignment.end, children: [
+        _VideoPositionSliderControl(controller: _controller!),
+        IconButton(
+          onPressed: () {
+            if (_controller!.value.isPlaying) {
+              _controller!.pause();
+            } else {
+              _controller!.play();
+            }
+          },
+          icon: Icon(
+            _controller!.value.isPlaying
+              ? Icons.pause_circle_rounded
+              : Icons.play_circle_rounded,
+            size: 50,
+          ),
+        ),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _LightboxPageLayout(
+      routeEntranceAnimation: widget.routeEntranceAnimation,
+      message: widget.message,
+      buildBottomAppBar: _buildBottomAppBar,
+      child: SafeArea(
+        child: Center(
+          child: Stack(alignment: Alignment.center, children: [
+            if (_controller != null && _controller!.value.isInitialized)
+              AspectRatio(
+                aspectRatio: _controller!.value.aspectRatio,
+                child: VideoPlayer(_controller!)),
+            if (_controller == null || !_controller!.value.isInitialized || _controller!.value.isBuffering)
+              const SizedBox(
+                width: 32,
+                height: 32,
+                child: CircularProgressIndicator(color: Colors.white)),
+            ]))));
+  }
+}
+
+enum MediaType {
+  video,
+  image
+}
+
+Route<void> getLightboxRoute({
+  int? accountId,
+  BuildContext? context,
   required Message message,
   required Uri src,
+  required MediaType mediaType,
 }) {
   return AccountPageRouteBuilder(
+    accountId: accountId,
     context: context,
     fullscreenDialog: true,
     pageBuilder: (
@@ -218,7 +496,16 @@ Route getLightboxRoute({
       Animation<double> secondaryAnimation,
     ) {
       // TODO(#40): Drag down to close?
-      return _LightboxPage(routeEntranceAnimation: animation, message: message, src: src);
+      return switch (mediaType) {
+        MediaType.image => _ImageLightboxPage(
+          routeEntranceAnimation: animation,
+          message: message,
+          src: src),
+        MediaType.video => VideoLightboxPage(
+          routeEntranceAnimation: animation,
+          message: message,
+          src: src),
+      };
     },
     transitionsBuilder: (
       BuildContext context,

@@ -1,25 +1,34 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../api/core.dart';
+import '../api/exception.dart';
 import '../api/model/events.dart';
 import '../api/model/initial_snapshot.dart';
 import '../api/model/model.dart';
 import '../api/route/events.dart';
 import '../api/route/messages.dart';
+import '../api/backoff.dart';
 import '../log.dart';
+import '../notifications/receive.dart';
 import 'autocomplete.dart';
 import 'database.dart';
+import 'message.dart';
 import 'message_list.dart';
 import 'recent_dm_conversations.dart';
+import 'stream.dart';
+import 'typing_status.dart';
+import 'unreads.dart';
 
 export 'package:drift/drift.dart' show Value;
-export 'database.dart' show Account, AccountsCompanion;
+export 'database.dart' show Account, AccountsCompanion, AccountAlreadyExistsException;
 
 /// Store for all the user's data.
 ///
@@ -46,6 +55,24 @@ abstract class GlobalStore extends ChangeNotifier {
 
   // TODO settings (those that are per-device rather than per-account)
   // TODO push token, and other data corresponding to GlobalSessionState
+
+  /// Construct a new [ApiConnection], real or fake as appropriate.
+  ///
+  /// Where a per-account store is available, use [PerAccountStore.connection].
+  /// This method is for use before a per-account store exists, such as in
+  /// the login flow.
+  ApiConnection apiConnection({
+    required Uri realmUrl,
+    required int? zulipFeatureLevel, // required even though nullable; see [ApiConnection.zulipFeatureLevel]
+    String? email,
+    String? apiKey,
+  });
+
+  ApiConnection apiConnectionFromAccount(Account account) {
+    return apiConnection(
+      realmUrl: account.realmUrl, zulipFeatureLevel: account.zulipFeatureLevel,
+      email: account.email, apiKey: account.apiKey);
+  }
 
   final Map<int, PerAccountStore> _perAccountStores = {};
   final Map<int, Future<PerAccountStore>> _perAccountStoresLoading = {};
@@ -87,14 +114,26 @@ abstract class GlobalStore extends ChangeNotifier {
     }
 
     // It's up to us.  Start loading.
-    final account = getAccount(accountId);
-    assert(account != null, 'Account not found on global store');
-    future = loadPerAccount(account!);
+    future = loadPerAccount(accountId);
     _perAccountStoresLoading[accountId] = future;
     store = await future;
-    _perAccountStores[accountId] = store;
+    _setPerAccount(accountId, store);
     _perAccountStoresLoading.remove(accountId);
     return store;
+  }
+
+  Future<void> _reloadPerAccount(int accountId) async {
+    assert(_perAccountStores.containsKey(accountId));
+    assert(!_perAccountStoresLoading.containsKey(accountId));
+    final store = await loadPerAccount(accountId);
+    _setPerAccount(accountId, store);
+  }
+
+  void _setPerAccount(int accountId, PerAccountStore store) {
+    final oldStore = _perAccountStores[accountId];
+    _perAccountStores[accountId] = store;
+    notifyListeners();
+    oldStore?.dispose();
   }
 
   /// Load per-account data for the given account, unconditionally.
@@ -102,7 +141,7 @@ abstract class GlobalStore extends ChangeNotifier {
   /// This method should be called only by the implementation of [perAccount].
   /// Other callers interested in per-account data should use [perAccount]
   /// and/or [perAccountSync].
-  Future<PerAccountStore> loadPerAccount(Account account);
+  Future<PerAccountStore> loadPerAccount(int accountId);
 
   // Just the Iterables, not the actual Map, to avoid clients mutating the map.
   // Mutations should go through the setters/mutators below.
@@ -128,8 +167,30 @@ abstract class GlobalStore extends ChangeNotifier {
   /// Add an account to the underlying data store.
   Future<Account> doInsertAccount(AccountsCompanion data);
 
-  // More mutators as needed:
-  // Future<void> updateAccount...
+  /// Update an account in the store, returning the new version.
+  ///
+  /// The account with the given account ID will be updated.
+  /// It must already exist in the store.
+  ///
+  /// Fields that are present in `data` will be updated,
+  /// and fields not present will be left unmodified.
+  ///
+  /// Some fields should never change on an account,
+  /// and must not be present in `data`: namely `id`, `realmUrl`, `userId`.
+  Future<Account> updateAccount(int accountId, AccountsCompanion data) async {
+    assert(!data.id.present && !data.realmUrl.present && !data.userId.present);
+    assert(_accounts.containsKey(accountId));
+    await doUpdateAccount(accountId, data);
+    final result = _accounts.update(accountId, (value) => value.copyWithCompanion(data));
+    notifyListeners();
+    return result;
+  }
+
+  /// Update an account in the underlying data store.
+  Future<void> doUpdateAccount(int accountId, AccountsCompanion data);
+
+  @override
+  String toString() => '${objectRuntimeType(this, 'GlobalStore')}#${shortHash(this)}';
 }
 
 /// Store for the user's data for a given Zulip account.
@@ -137,89 +198,210 @@ abstract class GlobalStore extends ChangeNotifier {
 /// This should always have a consistent snapshot of the state on the server,
 /// as provided by the Zulip event system.
 ///
-/// An instance directly of this class will not attempt to poll an event queue
-/// to keep the data up to date.  For that behavior, see the subclass
-/// [LivePerAccountStore].
-class PerAccountStore extends ChangeNotifier {
-  /// Create a per-account data store that does not automatically stay up to date.
+/// This class does not attempt to poll an event queue
+/// to keep the data up to date.  For that behavior, see
+/// [UpdateMachine].
+class PerAccountStore extends ChangeNotifier with StreamStore, MessageStore {
+  /// Construct a store for the user's data, starting from the given snapshot.
   ///
-  /// For a [PerAccountStore] that polls an event queue to keep itself up to
-  /// date, use [LivePerAccountStore.fromInitialSnapshot].
-  PerAccountStore.fromInitialSnapshot({
-    required this.account,
-    required this.connection,
+  /// The global store must already have been updated with
+  /// [GlobalStore.updateAccount], if applicable, so that its data for
+  /// the given account agrees with the snapshot.
+  ///
+  /// If the [connection] parameter is omitted, it defaults
+  /// to `globalStore.apiConnectionFromAccount(account)`.
+  /// When present, it should be a connection that came from that method call,
+  /// but it may have already been used for other requests.
+  factory PerAccountStore.fromInitialSnapshot({
+    required GlobalStore globalStore,
+    required int accountId,
+    ApiConnection? connection,
     required InitialSnapshot initialSnapshot,
-  }) : zulipVersion = initialSnapshot.zulipVersion,
-       maxFileUploadSizeMib = initialSnapshot.maxFileUploadSizeMib,
-       realmDefaultExternalAccounts = initialSnapshot.realmDefaultExternalAccounts,
-       customProfileFields = _sortCustomProfileFields(initialSnapshot.customProfileFields),
-       userSettings = initialSnapshot.userSettings,
-       users = Map.fromEntries(
-         initialSnapshot.realmUsers
-         .followedBy(initialSnapshot.realmNonActiveUsers)
-         .followedBy(initialSnapshot.crossRealmBots)
-         .map((user) => MapEntry(user.userId, user))),
-       streams = Map.fromEntries(initialSnapshot.streams.map(
-         (stream) => MapEntry(stream.streamId, stream))),
-       subscriptions = Map.fromEntries(initialSnapshot.subscriptions.map(
-         (subscription) => MapEntry(subscription.streamId, subscription))),
-       recentDmConversationsView = RecentDmConversationsView(
-         initial: initialSnapshot.recentPrivateConversations, selfUserId: account.userId);
+  }) {
+    final account = globalStore.getAccount(accountId)!;
+    assert(account.zulipVersion == initialSnapshot.zulipVersion
+      && account.zulipMergeBase == initialSnapshot.zulipMergeBase
+      && account.zulipFeatureLevel == initialSnapshot.zulipFeatureLevel);
 
-  final Account account;
+    connection ??= globalStore.apiConnectionFromAccount(account);
+    assert(connection.zulipFeatureLevel == account.zulipFeatureLevel);
+
+    final streams = StreamStoreImpl(initialSnapshot: initialSnapshot);
+    return PerAccountStore._(
+      globalStore: globalStore,
+      connection: connection,
+      realmUrl: account.realmUrl,
+      maxFileUploadSizeMib: initialSnapshot.maxFileUploadSizeMib,
+      realmDefaultExternalAccounts: initialSnapshot.realmDefaultExternalAccounts,
+      realmEmoji: initialSnapshot.realmEmoji,
+      customProfileFields: _sortCustomProfileFields(initialSnapshot.customProfileFields),
+      accountId: accountId,
+      selfUserId: account.userId,
+      userSettings: initialSnapshot.userSettings,
+      users: Map.fromEntries(
+        initialSnapshot.realmUsers
+        .followedBy(initialSnapshot.realmNonActiveUsers)
+        .followedBy(initialSnapshot.crossRealmBots)
+        .map((user) => MapEntry(user.userId, user))),
+      typingStatus: TypingStatus(
+        selfUserId: account.userId,
+        typingStartedExpiryPeriod: Duration(milliseconds: initialSnapshot.serverTypingStartedExpiryPeriodMilliseconds),
+      ),
+      streams: streams,
+      messages: MessageStoreImpl(),
+      unreads: Unreads(
+        initial: initialSnapshot.unreadMsgs,
+        selfUserId: account.userId,
+        streamStore: streams,
+      ),
+      recentDmConversationsView: RecentDmConversationsView(
+        initial: initialSnapshot.recentPrivateConversations, selfUserId: account.userId),
+    );
+  }
+
+  PerAccountStore._({
+    required GlobalStore globalStore,
+    required this.connection,
+    required this.realmUrl,
+    required this.maxFileUploadSizeMib,
+    required this.realmDefaultExternalAccounts,
+    required this.realmEmoji,
+    required this.customProfileFields,
+    required this.accountId,
+    required this.selfUserId,
+    required this.userSettings,
+    required this.users,
+    required this.typingStatus,
+    required StreamStoreImpl streams,
+    required MessageStoreImpl messages,
+    required this.unreads,
+    required this.recentDmConversationsView,
+  }) : assert(selfUserId == globalStore.getAccount(accountId)!.userId),
+       assert(realmUrl == globalStore.getAccount(accountId)!.realmUrl),
+       assert(realmUrl == connection.realmUrl),
+       _globalStore = globalStore,
+       _streams = streams,
+       _messages = messages;
+
+  ////////////////////////////////////////////////////////////////
+  // Data.
+
+  ////////////////////////////////
+  // Where data comes from in the first place.
+
+  final GlobalStore _globalStore;
   final ApiConnection connection; // TODO(#135): update zulipFeatureLevel with events
 
-  // TODO(#135): Keep all this data updated by handling Zulip events from the server.
-
+  ////////////////////////////////
   // Data attached to the realm or the server.
-  final String zulipVersion; // TODO get from account; update there on initial snapshot
+
+  /// Always equal to `account.realmUrl` and `connection.realmUrl`.
+  final Uri realmUrl;
+
+  /// Resolve [reference] as a URL relative to [realmUrl].
+  ///
+  /// This returns null if [reference] fails to parse as a URL.
+  Uri? tryResolveUrl(String reference) => _tryResolveUrl(realmUrl, reference);
+
+  String get zulipVersion => account.zulipVersion;
   final int maxFileUploadSizeMib; // No event for this.
   final Map<String, RealmDefaultExternalAccount> realmDefaultExternalAccounts;
+  Map<String, RealmEmojiItem> realmEmoji;
   List<CustomProfileField> customProfileFields;
 
+  ////////////////////////////////
   // Data attached to the self-account on the realm.
+
+  final int accountId;
+  Account get account => _globalStore.getAccount(accountId)!;
+
+  /// Always equal to `account.userId`.
+  final int selfUserId;
+
   final UserSettings? userSettings; // TODO(server-5)
 
+  ////////////////////////////////
   // Users and data about them.
+
   final Map<int, User> users;
 
+  final TypingStatus typingStatus;
+
+  ////////////////////////////////
   // Streams, topics, and stuff about them.
-  final Map<int, ZulipStream> streams;
-  final Map<int, Subscription> subscriptions;
 
-  // TODO lots more data.  When adding, be sure to update handleEvent too.
+  @override
+  Map<int, ZulipStream> get streams => _streams.streams;
+  @override
+  Map<String, ZulipStream> get streamsByName => _streams.streamsByName;
+  @override
+  Map<int, Subscription> get subscriptions => _streams.subscriptions;
+  @override
+  UserTopicVisibilityPolicy topicVisibilityPolicy(int streamId, String topic) =>
+    _streams.topicVisibilityPolicy(streamId, topic);
 
-  // TODO call [RecentDmConversationsView.dispose] in [dispose]
+  final StreamStoreImpl _streams;
+
+  @visibleForTesting
+  StreamStoreImpl get debugStreamStore => _streams;
+
+  ////////////////////////////////
+  // Messages, and summaries of messages.
+
+  @override
+  Map<int, Message> get messages => _messages.messages;
+  @override
+  void registerMessageList(MessageListView view) =>
+    _messages.registerMessageList(view);
+  @override
+  void unregisterMessageList(MessageListView view) =>
+    _messages.unregisterMessageList(view);
+  @override
+  void reconcileMessages(List<Message> messages) {
+    _messages.reconcileMessages(messages);
+    // TODO(#649) notify [unreads] of the just-fetched messages
+    // TODO(#650) notify [recentDmConversationsView] of the just-fetched messages
+  }
+
+  final MessageStoreImpl _messages;
+
+  final Unreads unreads;
+
   final RecentDmConversationsView recentDmConversationsView;
 
-  final Set<MessageListView> _messageListViews = {};
-
-  void registerMessageList(MessageListView view) {
-    final added = _messageListViews.add(view);
-    assert(added);
-  }
-
-  void unregisterMessageList(MessageListView view) {
-    final removed = _messageListViews.remove(view);
-    assert(removed);
-  }
+  ////////////////////////////////
+  // Other digests of data.
 
   final AutocompleteViewManager autocompleteViewManager = AutocompleteViewManager();
+
+  // End of data.
+  ////////////////////////////////////////////////////////////////
 
   /// Called when the app is reassembled during debugging, e.g. for hot reload.
   ///
   /// This will redo from scratch any computations we can, such as parsing
   /// message contents.  It won't repeat network requests.
   void reassemble() {
-    for (final view in _messageListViews) {
-      view.reassemble();
-    }
+    _messages.reassemble();
     autocompleteViewManager.reassemble();
   }
 
-  void handleEvent(Event event) {
+  @override
+  void dispose() {
+    recentDmConversationsView.dispose();
+    unreads.dispose();
+    _messages.dispose();
+    typingStatus.dispose();
+    super.dispose();
+  }
+
+  Future<void> handleEvent(Event event) async {
     if (event is HeartbeatEvent) {
       assert(debugLog("server event: heartbeat"));
+    } else if (event is RealmEmojiUpdateEvent) {
+      assert(debugLog("server event: realm_emoji/update"));
+      realmEmoji = event.realmEmoji;
+      notifyListeners();
     } else if (event is AlertWordsEvent) {
       assert(debugLog("server event: alert_words"));
       // We don't yet store this data, so there's nothing to update.
@@ -245,7 +427,6 @@ class PerAccountStore extends ChangeNotifier {
     } else if (event is RealmUserAddEvent) {
       assert(debugLog("server event: realm_user/add"));
       users[event.person.userId] = event.person;
-      autocompleteViewManager.handleRealmUserAddEvent(event);
       notifyListeners();
     } else if (event is RealmUserRemoveEvent) {
       assert(debugLog("server event: realm_user/remove"));
@@ -258,15 +439,15 @@ class PerAccountStore extends ChangeNotifier {
       if (user == null) {
         return; // TODO log
       }
-      if (event.fullName != null)       user.fullName                   = event.fullName!;
-      if (event.avatarUrl != null)      user.avatarUrl                  = event.avatarUrl!;
-      if (event.avatarVersion != null)  user.avatarVersion              = event.avatarVersion!;
-      if (event.timezone != null)       user.timezone                   = event.timezone!;
-      if (event.botOwnerId != null)     user.botOwnerId                 = event.botOwnerId!;
-      if (event.role != null)           user.role                       = event.role!;
-      if (event.isBillingAdmin != null) user.isBillingAdmin             = event.isBillingAdmin!;
-      if (event.deliveryEmail != null)  user.deliveryEmailStaleDoNotUse = event.deliveryEmail!;
-      if (event.newEmail != null)       user.email                      = event.newEmail!;
+      if (event.fullName != null)       user.fullName       = event.fullName!;
+      if (event.avatarUrl != null)      user.avatarUrl      = event.avatarUrl!;
+      if (event.avatarVersion != null)  user.avatarVersion  = event.avatarVersion!;
+      if (event.timezone != null)       user.timezone       = event.timezone!;
+      if (event.botOwnerId != null)     user.botOwnerId     = event.botOwnerId!;
+      if (event.role != null)           user.role           = event.role!;
+      if (event.isBillingAdmin != null) user.isBillingAdmin = event.isBillingAdmin!;
+      if (event.deliveryEmail != null)  user.deliveryEmail  = event.deliveryEmail!.value;
+      if (event.newEmail != null)       user.email          = event.newEmail!;
       if (event.customProfileField != null) {
         final profileData = (user.profileData ??= {});
         final update = event.customProfileField!;
@@ -282,43 +463,43 @@ class PerAccountStore extends ChangeNotifier {
       }
       autocompleteViewManager.handleRealmUserUpdateEvent(event);
       notifyListeners();
-    } else if (event is StreamCreateEvent) {
-      assert(debugLog("server event: stream/create"));
-      streams.addEntries(event.streams.map((stream) => MapEntry(stream.streamId, stream)));
-      // (Don't touch `subscriptions`. If the user is subscribed to the stream,
-      // details will come in a later `subscription` event.)
+    } else if (event is StreamEvent) {
+      assert(debugLog("server event: stream/${event.op}"));
+      _streams.handleStreamEvent(event);
       notifyListeners();
-    } else if (event is StreamDeleteEvent) {
-      assert(debugLog("server event: stream/delete"));
-      for (final stream in event.streams) {
-        streams.remove(stream.streamId);
-        subscriptions.remove(stream.streamId);
-      }
+    } else if (event is SubscriptionEvent) {
+      assert(debugLog("server event: subscription/${event.op}"));
+      _streams.handleSubscriptionEvent(event);
+      notifyListeners();
+    } else if (event is UserTopicEvent) {
+      assert(debugLog("server event: user_topic"));
+      _streams.handleUserTopicEvent(event);
       notifyListeners();
     } else if (event is MessageEvent) {
       assert(debugLog("server event: message ${jsonEncode(event.message.toJson())}"));
+      _messages.handleMessageEvent(event);
+      unreads.handleMessageEvent(event);
       recentDmConversationsView.handleMessageEvent(event);
-      for (final view in _messageListViews) {
-        view.maybeAddMessage(event.message);
-      }
+      // When adding anything here (to handle [MessageEvent]),
+      // it probably belongs in [reconcileMessages] too.
     } else if (event is UpdateMessageEvent) {
       assert(debugLog("server event: update_message ${event.messageId}"));
-      for (final view in _messageListViews) {
-        view.maybeUpdateMessage(event);
-      }
+      _messages.handleUpdateMessageEvent(event);
+      unreads.handleUpdateMessageEvent(event);
     } else if (event is DeleteMessageEvent) {
       assert(debugLog("server event: delete_message ${event.messageIds}"));
-      // TODO handle
+      _messages.handleDeleteMessageEvent(event);
+      unreads.handleDeleteMessageEvent(event);
     } else if (event is UpdateMessageFlagsEvent) {
       assert(debugLog("server event: update_message_flags/${event.op} ${event.flag.toJson()}"));
-      for (final view in _messageListViews) {
-        view.maybeUpdateMessageFlags(event);
-      }
+      _messages.handleUpdateMessageFlagsEvent(event);
+      unreads.handleUpdateMessageFlagsEvent(event);
+    } else if (event is TypingEvent) {
+      assert(debugLog("server event: typing/${event.op} ${event.messageType}"));
+      typingStatus.handleTypingEvent(event);
     } else if (event is ReactionEvent) {
       assert(debugLog("server event: reaction/${event.op}"));
-      for (final view in _messageListViews) {
-        view.maybeUpdateMessageReactions(event);
-      }
+      _messages.handleReactionEvent(event);
     } else if (event is UnexpectedEvent) {
       assert(debugLog("server event: ${jsonEncode(event.toJson())}")); // TODO log better
     } else {
@@ -330,7 +511,11 @@ class PerAccountStore extends ChangeNotifier {
   Future<void> sendMessage({required MessageDestination destination, required String content}) {
     // TODO implement outbox; see design at
     //   https://chat.zulip.org/#narrow/stream/243-mobile-team/topic/.23M3881.20Sending.20outbox.20messages.20is.20fraught.20with.20issues/near/1405739
-    return _apiSendMessage(connection, destination: destination, content: content);
+    return _apiSendMessage(connection,
+      destination: destination,
+      content: content,
+      readBySender: true,
+    );
   }
 
   static List<CustomProfileField> _sortCustomProfileFields(List<CustomProfileField> initialCustomProfileFields) {
@@ -347,22 +532,44 @@ class PerAccountStore extends ChangeNotifier {
     final nonDisplayFields = initialCustomProfileFields.where((e) => e.displayInProfileSummary != true);
     return displayFields.followedBy(nonDisplayFields).toList();
   }
+
+  @override
+  String toString() => '${objectRuntimeType(this, 'PerAccountStore')}#${shortHash(this)}';
 }
 
 const _apiSendMessage = sendMessage; // Bit ugly; for alternatives, see: https://chat.zulip.org/#narrow/stream/243-mobile-team/topic/flutter.3A.20PerAccountStore.20methods/near/1545809
+const _tryResolveUrl = tryResolveUrl;
+
+/// Like [Uri.resolve], but on failure return null instead of throwing.
+Uri? tryResolveUrl(Uri baseUrl, String reference) {
+  try {
+    return baseUrl.resolve(reference);
+  } on FormatException {
+    return null;
+  }
+}
 
 /// A [GlobalStore] that uses a live server and live, persistent local database.
 ///
 /// The underlying data store is an [AppDatabase] corresponding to a SQLite
 /// database file in the app's persistent storage on the device.
 ///
-/// The per-account stores will be instances of [LivePerAccountStore],
-/// with data loaded through a live [ApiConnection].
+/// The per-account stores will use a live [ApiConnection],
+/// and will have an associated [UpdateMachine].
 class LiveGlobalStore extends GlobalStore {
   LiveGlobalStore._({
     required AppDatabase db,
     required super.accounts,
   }) : _db = db;
+
+  @override
+  ApiConnection apiConnection({
+      required Uri realmUrl, required int? zulipFeatureLevel,
+      String? email, String? apiKey}) {
+    return ApiConnection.live(
+      realmUrl: realmUrl, zulipFeatureLevel: zulipFeatureLevel,
+      email: email, apiKey: apiKey);
+  }
 
   // We keep the API simple and synchronous for the bulk of the app's code
   // by doing this loading up front before constructing a [GlobalStore].
@@ -394,8 +601,9 @@ class LiveGlobalStore extends GlobalStore {
   final AppDatabase _db;
 
   @override
-  Future<PerAccountStore> loadPerAccount(Account account) {
-    return LivePerAccountStore.load(account);
+  Future<PerAccountStore> loadPerAccount(int accountId) async {
+    final updateMachine = await UpdateMachine.load(this, accountId);
+    return updateMachine.store;
   }
 
   @override
@@ -410,61 +618,209 @@ class LiveGlobalStore extends GlobalStore {
       ..where((a) => a.id.equals(accountId))
     ).getSingle();
   }
+
+  @override
+  Future<void> doUpdateAccount(int accountId, AccountsCompanion data) async {
+    final rowsAffected = await (_db.update(_db.accounts)
+      ..where((a) => a.id.equals(accountId))
+    ).write(data);
+    assert(rowsAffected == 1);
+  }
+
+  @override
+  String toString() => '${objectRuntimeType(this, 'LiveGlobalStore')}#${shortHash(this)}';
 }
 
-/// A [PerAccountStore] which polls an event queue to stay up to date.
-class LivePerAccountStore extends PerAccountStore {
-  LivePerAccountStore.fromInitialSnapshot({
-    required super.account,
-    required super.connection,
-    required super.initialSnapshot,
+/// A [PerAccountStore] plus an event-polling loop to stay up to date.
+class UpdateMachine {
+  UpdateMachine.fromInitialSnapshot({
+    required this.store,
+    required InitialSnapshot initialSnapshot,
   }) : queueId = initialSnapshot.queueId ?? (() {
          // The queueId is optional in the type, but should only be missing in the
          // case of unauthenticated access to a web-public realm.  We authenticated.
          throw Exception("bad initial snapshot: missing queueId");
        })(),
-       lastEventId = initialSnapshot.lastEventId,
-       super.fromInitialSnapshot();
+       lastEventId = initialSnapshot.lastEventId;
 
   /// Load the user's data from the server, and start an event queue going.
   ///
   /// In the future this might load an old snapshot from local storage first.
-  static Future<PerAccountStore> load(Account account) async {
-    final connection = ApiConnection.live(
-      realmUrl: account.realmUrl, zulipFeatureLevel: account.zulipFeatureLevel,
-      email: account.email, apiKey: account.apiKey);
+  static Future<UpdateMachine> load(GlobalStore globalStore, int accountId) async {
+    Account account = globalStore.getAccount(accountId)!;
+    final connection = globalStore.apiConnectionFromAccount(account);
 
     final stopwatch = Stopwatch()..start();
-    final initialSnapshot = await registerQueue(connection); // TODO retry
+    final initialSnapshot = await _registerQueueWithRetry(connection);
     final t = (stopwatch..stop()).elapsed;
-    // TODO log the time better
-    if (kDebugMode) print("initial fetch time: ${t.inMilliseconds}ms");
+    assert(debugLog("initial fetch time: ${t.inMilliseconds}ms"));
 
-    final store = LivePerAccountStore.fromInitialSnapshot(
-      account: account,
+    if (initialSnapshot.zulipVersion != account.zulipVersion
+        || initialSnapshot.zulipMergeBase != account.zulipMergeBase
+        || initialSnapshot.zulipFeatureLevel != account.zulipFeatureLevel) {
+      account = await globalStore.updateAccount(accountId, AccountsCompanion(
+        zulipVersion: Value(initialSnapshot.zulipVersion),
+        zulipMergeBase: Value(initialSnapshot.zulipMergeBase),
+        zulipFeatureLevel: Value(initialSnapshot.zulipFeatureLevel),
+      ));
+      connection.zulipFeatureLevel = initialSnapshot.zulipFeatureLevel;
+    }
+
+    final store = PerAccountStore.fromInitialSnapshot(
+      globalStore: globalStore,
+      accountId: accountId,
       connection: connection,
       initialSnapshot: initialSnapshot,
     );
-    store.poll();
-    return store;
+    final updateMachine = UpdateMachine.fromInitialSnapshot(
+      store: store, initialSnapshot: initialSnapshot);
+    updateMachine.poll();
+    // TODO do registerNotificationToken before registerQueue:
+    //   https://github.com/zulip/zulip-flutter/pull/325#discussion_r1365982807
+    updateMachine.registerNotificationToken();
+    return updateMachine;
   }
 
+  final PerAccountStore store;
   final String queueId;
   int lastEventId;
 
-  void poll() async {
+  static Future<InitialSnapshot> _registerQueueWithRetry(
+      ApiConnection connection) async {
+    BackoffMachine? backoffMachine;
     while (true) {
-      final result = await getEvents(connection,
-        queueId: queueId, lastEventId: lastEventId);
-      // TODO handle errors on get-events; retry with backoff
-      // TODO abort long-poll and close ApiConnection on [dispose]
+      try {
+        return await registerQueue(connection);
+      } catch (e) {
+        assert(debugLog('Error fetching initial snapshot: $e\n'
+          'Backing off, then will retry…'));
+        // TODO tell user if initial-fetch errors persist, or look non-transient
+        await (backoffMachine ??= BackoffMachine()).wait();
+        assert(debugLog('… Backoff wait complete, retrying initial fetch.'));
+      }
+    }
+  }
+
+  Completer<void>? _debugLoopSignal;
+
+  /// In debug mode, causes the polling loop to pause before the next
+  /// request and wait for [debugAdvanceLoop] to be called.
+  void debugPauseLoop() {
+    assert((){
+      assert(_debugLoopSignal == null);
+      _debugLoopSignal = Completer();
+      return true;
+    }());
+  }
+
+  /// In debug mode, after a call to [debugPauseLoop], causes the
+  /// polling loop to make one more request and then pause again.
+  void debugAdvanceLoop() {
+    assert((){
+      _debugLoopSignal!.complete();
+      return true;
+    }());
+  }
+
+  void poll() async {
+    final backoffMachine = BackoffMachine();
+
+    while (true) {
+      if (_debugLoopSignal != null) {
+        await _debugLoopSignal!.future;
+        assert(() {
+          _debugLoopSignal = Completer();
+          return true;
+        }());
+      }
+
+      final GetEventsResult result;
+      try {
+        result = await getEvents(store.connection,
+          queueId: queueId, lastEventId: lastEventId);
+      } catch (e) {
+        switch (e) {
+          case ZulipApiException(code: 'BAD_EVENT_QUEUE_ID'):
+            assert(debugLog('Lost event queue for $store.  Replacing…'));
+            await store._globalStore._reloadPerAccount(store.accountId);
+            dispose();
+            debugLog('… Event queue replaced.');
+            return;
+
+          case Server5xxException() || NetworkException():
+            assert(debugLog('Transient error polling event queue for $store: $e\n'
+                'Backing off, then will retry…'));
+            // TODO tell user if transient polling errors persist
+            // TODO reset to short backoff eventually
+            await backoffMachine.wait();
+            assert(debugLog('… Backoff wait complete, retrying poll.'));
+            continue;
+
+          default:
+            assert(debugLog('Error polling event queue for $store: $e\n'
+                'Backing off and retrying even though may be hopeless…'));
+            // TODO tell user on non-transient error in polling
+            await backoffMachine.wait();
+            assert(debugLog('… Backoff wait complete, retrying poll.'));
+            continue;
+        }
+      }
+
       final events = result.events;
       for (final event in events) {
-        handleEvent(event);
+        await store.handleEvent(event);
       }
       if (events.isNotEmpty) {
         lastEventId = events.last.id;
       }
     }
   }
+
+  /// In debug mode, controls whether [registerNotificationToken] should
+  /// have its normal effect.
+  ///
+  /// Outside of debug mode, this is always true and the setter has no effect.
+  static bool get debugEnableRegisterNotificationToken {
+    bool result = true;
+    assert(() {
+      result = _debugEnableRegisterNotificationToken;
+      return true;
+    }());
+    return result;
+  }
+  static bool _debugEnableRegisterNotificationToken = true;
+  static set debugEnableRegisterNotificationToken(bool value) {
+    assert(() {
+      _debugEnableRegisterNotificationToken = value;
+      return true;
+    }());
+  }
+
+  /// Send this client's notification token to the server, now and if it changes.
+  ///
+  /// TODO The returned future isn't especially meaningful (it may or may not
+  ///   mean we actually sent the token).  Make it just `void` once we fix the
+  ///   one test that relies on the future.
+  // TODO(#322) save acked token, to dedupe updating it on the server
+  // TODO(#323) track the registerFcmToken/etc request, warn if not succeeding
+  Future<void> registerNotificationToken() async {
+    if (!debugEnableRegisterNotificationToken) {
+      return;
+    }
+    NotificationService.instance.token.addListener(_registerNotificationToken);
+    await _registerNotificationToken();
+  }
+
+  Future<void> _registerNotificationToken() async {
+    final token = NotificationService.instance.token.value;
+    if (token == null) return;
+    await NotificationService.registerToken(store.connection, token: token);
+  }
+
+  void dispose() { // TODO abort long-poll and close ApiConnection
+    NotificationService.instance.token.removeListener(_registerNotificationToken);
+  }
+
+  @override
+  String toString() => '${objectRuntimeType(this, 'UpdateMachine')}#${shortHash(this)}';
 }
