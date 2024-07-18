@@ -3,90 +3,23 @@
 A Zulip Kind of interface for note taking for Android and iOS, using Flutter.
 
 This app is currently [in beta][beta].
-When it's ready, it [will become the new][] official mobile Zulip client.
 To see what work is planned before that launch,
 see the [milestones][] and the [project board][].
 
 [beta]: https://chat.zulip.org/#narrow/stream/2-general/topic/Flutter/near/1708728
-[will become the new]: https://chat.zulip.org/#narrow/stream/2-general/topic/Flutter/near/1582367
 [milestones]: https://github.com/zulip/zulip-flutter/milestones?direction=asc&sort=title
-[project board]: https://github.com/orgs/zulip/projects/5/views/4
 
 
 ## Using Zulip
 
-To use Zulip on iOS or Android, install the [official mobile Zulip client][].
+Install zulip note taking app and connect to a zulip server.
 
 You can also [try out this beta app][beta].
-
-[official mobile Zulip client]: https://github.com/zulip/zulip-mobile#readme
 
 
 ## Contributing
 
 Contributions to this app are welcome.
-
-If you're looking to participate in Google Summer of Code with Zulip,
-this is one of the projects we're [accepting GSoC 2024 applications][]
-for.
-
-[accepting GSoC 2024 applications]: https://zulip.readthedocs.io/en/latest/outreach/gsoc.html#mobile-app
-
-
-### Picking an issue to work on
-
-First, see the Zulip project guide to [your first codebase contribution][].
-Follow the instructions there for joining the Zulip community server,
-reading about [what makes a great Zulip contributor][],
-browsing through recent commits and the codebase,
-and the Zulip guide to Git.
-
-To find possible issues to work on, see our [project board][].
-Look for issues up through the "Launch" milestone,
-and that aren't already assigned.
-
-Follow the Zulip guide to [picking an issue to work on][],
-trying several issues until you find one you're confident
-you'll be able to take on effectively.
-
-*After you've done that*, claim the issue by posting a comment
-on the issue thread, saying you'd like to work on it
-and describing your progress.
-
-[your first codebase contribution]: https://zulip.readthedocs.io/en/latest/contributing/contributing.html#your-first-codebase-contribution
-[what makes a great Zulip contributor]: https://zulip.readthedocs.io/en/latest/contributing/contributing.html#what-makes-a-great-zulip-contributor
-[picking an issue to work on]: https://zulip.readthedocs.io/en/latest/contributing/contributing.html#picking-an-issue-to-work-on
-
-
-### Submitting a pull request
-
-Follow the Zulip project's guide to your first codebase contribution
-for [working on an issue][] and [submitting a pull request][].
-It's important to take the time to make your work as
-easy as possible for others to review.
-
-Two specific points to expand on:
-
- * Before we can review your PR in detail, your changes will need
-   tests.  See ["Writing tests"](#writing-tests) below.
-
-   It will also need all new and existing tests to be passing.
-   See ["Tests"](#tests) below about running the tests.
-
- * Your changes will need to be organized into
-   [clear and coherent commits][commit-style],
-   following [Zulip's commit style guide][commit-style].
-
-   This is always required before we can merge your PR.  Depending on
-   your changes' complexity, it may also be required before we can
-   review it in detail.  (The main exception is that if the change
-   should be a single commit, we can review it even with a messier
-   commit structure.)
-
-[working on an issue]: https://zulip.readthedocs.io/en/latest/contributing/contributing.html#working-on-an-issue
-[submitting a pull request]: https://zulip.readthedocs.io/en/latest/contributing/review-process.html
-[commit-style]: https://zulip.readthedocs.io/en/latest/contributing/commit-discipline.html
-
 
 ## Getting started in developing this beta app
 
